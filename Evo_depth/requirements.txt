@@ -7,7 +7,7 @@ accelerator
 deepspeed
 diffusers
 timm
-einop
+einops
 xformers
 ninja
 
