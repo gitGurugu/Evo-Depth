@@ -87,15 +87,13 @@ def fliter(filter_category, task_suite_name, json_path=None):
     
     
 
+handlers = [logging.FileHandler(args.log_file, mode='a')]
+if os.isatty(2):
+    handlers.append(logging.StreamHandler())
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        
-        logging.FileHandler(args.log_file, mode='a'),
-        logging.StreamHandler()
-    ]
-
+    handlers=handlers,
 )
 log = logging.getLogger(__name__)
 
@@ -141,7 +139,7 @@ def obs_to_json_dict(obs, prompt, resize_size=448):
 def get_libero_env(task, resolution=448, seed=args.SEED):
     task_description = task.language
     task_bddl_file = pathlib.Path(get_libero_path("bddl_files")) / task.problem_folder / task.bddl_file
-    env_args = {"bddl_file_name": task_bddl_file, "camera_heights": resolution, "camera_widths": resolution}
+    env_args = {"bddl_file_name": str(task_bddl_file), "camera_heights": resolution, "camera_widths": resolution}
     env = OffScreenRenderEnv(**env_args)
     env.seed(seed)
     return env, task_description

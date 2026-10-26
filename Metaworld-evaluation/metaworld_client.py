@@ -4,9 +4,27 @@ import asyncio
 import datetime
 import json
 import os
+import sys
+import threading
+from collections import deque
 from dataclasses import dataclass
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+
+if "--viewer" in sys.argv:
+    os.environ.setdefault("DISPLAY", ":1")
+    _vgl_dir = "/home/kjl/opt/vgl/usr/lib"
+    _faker = os.path.join(_vgl_dir, "libvglfaker.so")
+    _dlfaker = os.path.join(_vgl_dir, "libdlfaker.so")
+    _preload = os.environ.get("LD_PRELOAD", "")
+    if os.path.exists(_faker) and "libvglfaker.so" not in _preload:
+        os.environ["VGL_DISPLAY"] = "egl"
+        os.environ["LD_PRELOAD"] = f"{_dlfaker}:{_faker}" + (f":{_preload}" if _preload else "")
+        os.execv(sys.executable, [sys.executable, *sys.argv])
+    elif "libvglfaker.so" not in _preload:
+        os.environ.setdefault("__GLX_VENDOR_LIBRARY_NAME", "mesa")
+        os.environ.setdefault("LIBGL_ALWAYS_SOFTWARE", "1")
 
 import cv2
 import gymnasium as gym
@@ -178,7 +196,132 @@ def parse_args():
     p.add_argument("--camera_name", type=str, default=None)
     p.add_argument("--order_json", type=str, default=None)
     p.add_argument("--tasks_jsonl", type=str, default=None)
+    p.add_argument("--preview_port", type=int, default=0, help="MJPEG preview port, 0 disables")
+    p.add_argument("--viewer", action="store_true", help="Open the MuJoCo viewer on DISPLAY")
     return p.parse_args()
+
+
+# ---------------- MuJoCo viewer (off unless --viewer) ----------------
+_viewer = None
+_viewer_model = None
+_viewer_enabled = False
+
+
+def sync_mujoco_viewer(env) -> None:
+    global _viewer, _viewer_model
+    if not _viewer_enabled:
+        return
+    uw = getattr(env, "unwrapped", env)
+    model, data = uw.model, uw.data
+    if _viewer is None or _viewer_model is not model or not _viewer.is_running():
+        if _viewer is not None:
+            try:
+                _viewer.close()
+            except Exception:
+                pass
+        import mujoco.viewer
+
+        _viewer = mujoco.viewer.launch_passive(model, data)
+        _viewer_model = model
+        print(
+            "[viewer] MuJoCo viewer on",
+            os.environ.get("DISPLAY"),
+            "gpu" if os.environ.get("VGL_DISPLAY") == "egl" else "cpu",
+        )
+    _viewer.sync()
+
+
+# ---------------- Preview (off unless --preview_port) ----------------
+_preview = None
+
+
+class _Preview:
+    """MJPEG of sim frames as they are rendered. ponytail: queue cap 24, no playback delay; drop oldest if the browser falls behind."""
+
+    def __init__(self, port: int):
+        self._cond = threading.Condition()
+        self._jpg = b""
+        self._q = deque()
+        self._httpd = ThreadingHTTPServer(("0.0.0.0", port), self._handler())
+        threading.Thread(target=self._httpd.serve_forever, daemon=True).start()
+        print(f"[preview] http://0.0.0.0:{self._httpd.server_address[1]}/")
+
+    def push(self, bgr: np.ndarray) -> None:
+        ok, buf = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
+        if not ok:
+            return
+        jpg = buf.tobytes()
+        with self._cond:
+            self._jpg = jpg
+            if len(self._q) >= 24:
+                self._q.popleft()
+            self._q.append(jpg)
+            self._cond.notify_all()
+
+    def _handler(self):
+        preview = self
+
+        class H(BaseHTTPRequestHandler):
+            def log_message(self, fmt, *args):
+                return
+
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                if path == "/frame.jpg":
+                    with preview._cond:
+                        jpg = preview._jpg
+                    self.send_response(200)
+                    self.send_header("Content-Type", "image/jpeg")
+                    self.send_header("Content-Length", str(len(jpg)))
+                    self.send_header("Cache-Control", "no-store")
+                    self.end_headers()
+                    self.wfile.write(jpg)
+                    return
+                if path != "/stream":
+                    body = b"<img src='/stream' style='max-width:100%'>"
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/html")
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                while True:
+                    with preview._cond:
+                        while not preview._q:
+                            preview._cond.wait()
+                        jpg = preview._q.popleft()
+                    part = (
+                        b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "
+                        + str(len(jpg)).encode()
+                        + b"\r\n\r\n"
+                        + jpg
+                        + b"\r\n"
+                    )
+                    try:
+                        self.wfile.write(part)
+                        self.wfile.flush()
+                    except Exception:
+                        break
+
+        return H
+
+
+def _preview_self_check() -> None:
+    import urllib.request
+
+    preview = _Preview(0)
+    img = np.zeros((8, 8, 3), dtype=np.uint8)
+    img[:] = (0, 0, 255)
+    preview.push(img)
+    port = preview._httpd.server_address[1]
+    with urllib.request.urlopen(f"http://127.0.0.1:{port}/frame.jpg", timeout=2) as resp:
+        data = resp.read()
+    assert data[:2] == b"\xff\xd8" and data[-2:] == b"\xff\xd9", data[:16]
+    preview._httpd.shutdown()
+    print("preview self-check ok")
 
 
 # ---------------- Utils ----------------
@@ -241,6 +384,8 @@ def render_single_bgr(env, conf: EvalConfig) -> np.ndarray:
         except Exception:
             pass
 
+    if _preview is not None:
+        _preview.push(bgr)
     return bgr
 
 
@@ -446,6 +591,7 @@ async def eval_mt50_with_groups(conf: EvalConfig, prompts: PromptBook):
                     pass
 
                 while steps < conf.episode_horizon and not done:
+                    sync_mujoco_viewer(sub)
                     img_bgr = render_single_bgr(sub, conf)
 
                     if conf.save_video:
@@ -470,6 +616,9 @@ async def eval_mt50_with_groups(conf: EvalConfig, prompts: PromptBook):
                         a4 = np.clip(a4, sub.action_space.low, sub.action_space.high)
                         obs, _, terminated, truncated, info = sub.step(a4)
                         steps += 1
+                        sync_mujoco_viewer(sub)
+                        if _preview is not None:
+                            render_single_bgr(sub, conf)
 
                         if isinstance(info, dict) and info.get("success", 0) == 1:
                             success_counts[idx] += 1
@@ -547,6 +696,10 @@ async def _amain():
         flat["tasks_jsonl"] = str(p if p.is_absolute() else base_dir / p)
 
     conf = build_eval_config(flat, args.run_name)
+    global _preview, _viewer_enabled
+    _viewer_enabled = bool(args.viewer)
+    if args.preview_port:
+        _preview = _Preview(args.preview_port)
     os.environ.setdefault("MUJOCO_GL", conf.mujoco_gl)
     gym.logger.min_level = gym.logger.ERROR
 
@@ -584,4 +737,7 @@ async def _amain():
 
 
 if __name__ == "__main__":
-    asyncio.run(_amain())
+    if os.environ.get("METAWORLD_PREVIEW_SELF_CHECK") == "1":
+        _preview_self_check()
+    else:
+        asyncio.run(_amain())
