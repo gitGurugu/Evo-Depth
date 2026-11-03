@@ -382,14 +382,25 @@ class LeRobotDataset(Dataset):
                 import av
                 try:
                     with av.open(path) as container:
-                        for frame in container.decode(video=0):
-                            if frame.time >= timestamp:
-                                frames.append(Image.fromarray(frame.to_ndarray(format='rgb24')))
+                        stream = container.streams.video[0]
+                        # Frame threads segfault in a forked DataLoader worker after a bad packet.
+                        stream.thread_type = "NONE"
+                        if timestamp > 0:
+                            try:
+                                container.seek(int(timestamp * 1_000_000), backward=True)
+                            except Exception:
+                                container.seek(0)
+                        picked = None
+                        for frame in container.decode(stream):
+                            picked = frame
+                            if frame.time is not None and frame.time + 1e-4 >= timestamp:
                                 break
+                        if picked is None:
+                            raise RuntimeError(f"no frame at t={timestamp} in {path}")
+                        frames.append(Image.fromarray(picked.to_ndarray(format="rgb24")))
 
                 except Exception as e:
-                    print(f"Failed to read video file: {path}")
-                    print(f"Error message: {str(e)}")
+                    logging.info(f"Failed to read video file: {path}: {e}")
                     raise
             else:
                 raise NotImplementedError(f"Video backend {self.video_backend} not implemented")
@@ -399,7 +410,9 @@ class LeRobotDataset(Dataset):
     def __len__(self):
         return len(self.data)
 
-    def __getitem__(self, idx):
+    def __getitem__(self, idx, _tries=0):
+        if _tries > 8:
+            raise RuntimeError(f"too many consecutive bad samples, last index {idx}")
 
         cache_filepath = self.data[idx]
         
@@ -408,8 +421,7 @@ class LeRobotDataset(Dataset):
                 item = pickle.load(f)
         except Exception as e:
             logging.info(f"cannot load cache file {cache_filepath}: {str(e)}")
-            
-            return self[random.randint(0, len(self.data)-1)]
+            return self.__getitem__(random.randrange(len(self.data)), _tries + 1)
  
         
         arm_key = item["arm_key"]
@@ -422,7 +434,7 @@ class LeRobotDataset(Dataset):
         except Exception as e:
       
             logging.info(f"skipping sample that cannot decode video {self.data[idx]}: {e}")
-            return self[random.randint(0, len(self.data)-1)]  
+            return self.__getitem__(random.randrange(len(self.data)), _tries + 1)  
 
         images = frames
 
@@ -508,4 +520,22 @@ class LeRobotDataset(Dataset):
             "action_mask": action_mask,
             "embodiment_id": torch.tensor(embodiment_id, dtype=torch.long)
         }
+
+
+def custom_collate_fn(batch):
+    return {
+        "prompts": [item["prompt"] for item in batch],
+        "images": [item["images"] for item in batch],
+        "states": torch.stack([item["state"] for item in batch], dim=0),
+        "actions": torch.stack([item["action"] for item in batch], dim=0),
+        "action_mask": torch.stack([item["action_mask"] for item in batch], dim=0),
+        "state_mask": torch.stack([item["state_mask"] for item in batch], dim=0),
+        "image_masks": torch.stack([item["image_mask"] for item in batch], dim=0),
+        "embodiment_ids": torch.stack([item["embodiment_id"] for item in batch], dim=0),
+    }
+
+
+def worker_init_fn(worker_id):
+    # Workers only decode video. A forked CUDA context makes libcuda SIGSEGV later.
+    os.environ["CUDA_VISIBLE_DEVICES"] = ""
 

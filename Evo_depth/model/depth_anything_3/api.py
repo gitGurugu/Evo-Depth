@@ -288,6 +288,7 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
             intrinsics.copy() if intrinsics is not None else None,
             process_res,
             process_res_method,
+            num_workers=1,
         )
         # end_time = time.time()
         # logger.info(

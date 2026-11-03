@@ -64,26 +64,6 @@ def inspect_named_submodules(module_dict: dict, verbose: bool = True):
     logging.info("=" * 70)
 
 
-def custom_collate_fn(batch):
-    prompts = [item["prompt"] for item in batch]
-    images = [item["images"] for item in batch]
-    states = torch.stack([item["state"] for item in batch], dim=0)
-    actions = torch.stack([item["action"] for item in batch], dim=0)
-    action_mask = torch.stack([item["action_mask"] for item in batch], dim=0)
-    image_masks = torch.stack([item["image_mask"] for item in batch], dim=0)
-    state_mask = torch.stack([item["state_mask"] for item in batch], dim=0)
-    embodiment_ids = torch.stack([item["embodiment_id"] for item in batch], dim=0)
-
-    return {
-        "prompts": prompts,
-        "images": images,
-        "states": states,
-        "actions": actions,
-        "action_mask": action_mask,
-        "state_mask": state_mask,
-        "image_masks": image_masks,
-        "embodiment_ids": embodiment_ids
-    }
 
 def get_lr_lambda(warmup_steps, total_steps, resume_step=0):
     def lr_lambda(current_step):
@@ -118,6 +98,7 @@ def init_wandb(config: dict, accelerator: Accelerator):
     if accelerator.is_main_process:
         if get_with_warning(config, "disable_wandb", False):
             os.environ["WANDB_MODE"] = "disabled"
+            return
 
         wandb.init(
             project=get_with_warning(config, "wandb_project", "default_run"),
@@ -171,15 +152,19 @@ def prepare_dataloader(dataset, config: dict) -> DataLoader:
     batch_size = get_with_warning(config, "batch_size", 8)
     num_workers = get_with_warning(config, "num_workers", 8)
 
+    from dataset.lerobot_dataset_pretrain_mp import custom_collate_fn, worker_init_fn
+
     dataloader = DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=True,
         num_workers=num_workers,
         pin_memory=True,
-        persistent_workers=False,
+        persistent_workers=num_workers > 0,
+        multiprocessing_context="spawn" if num_workers > 0 else None,
+        worker_init_fn=worker_init_fn if num_workers > 0 else None,
         drop_last=True,
-        collate_fn=custom_collate_fn
+        collate_fn=custom_collate_fn,
     )
     if accelerator is None or accelerator.is_main_process:
         logging.info(f"Initialized dataloader with batch size {batch_size}")
@@ -198,13 +183,13 @@ def log_training_step(step, loss, total_norm, clipped_norm, scheduler, dataloade
     if accelerator is None or accelerator.is_main_process:
         logging.info(f"Estimated Epoch: {current_epoch:.2f}")
         logging.info(f"[Step {step}] Loss: {loss.item():.4f}")
-        wandb.log({
-            "step": step,
-            "loss": loss.item(),
-            "current_epoch": current_epoch,
-            "learning_rate": scheduler.get_last_lr()[0],
-            
-        })
+        if os.environ.get("WANDB_MODE") != "disabled":
+            wandb.log({
+                "step": step,
+                "loss": loss.item(),
+                "current_epoch": current_epoch,
+                "learning_rate": scheduler.get_last_lr()[0],
+            })
         swanlab.log({
             "step": step,
             "loss": loss.item(),
@@ -441,11 +426,11 @@ def train(config):
             state_mask = batch["state_mask"]
             embodiment_ids = batch["embodiment_ids"]
             fused_tokens_list = []
-            
+
             for prompt, images, image_mask in zip(prompts, images_batch, image_masks):
                 fused = model.get_vl_embeddings(images=images, image_mask=image_mask, prompt=prompt, return_cls_only=False)
                 fused_tokens_list.append(fused.to(dtype=torch.bfloat16))
-            
+
             fused_tokens = torch.cat(fused_tokens_list, dim=0)
 
             with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):

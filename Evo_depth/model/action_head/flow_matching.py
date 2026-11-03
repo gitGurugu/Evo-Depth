@@ -105,7 +105,7 @@ class MultiEmbodimentActionEncoder(nn.Module):
             cat_ids = category_id.unsqueeze(1).repeat(1, H).reshape(B * H)
         out = self.activation(self.W1(x, cat_ids))            
     
-        pos_enc = self.pos_encoding(H).to(out.device)       
+        pos_enc = self.pos_encoding(H).to(device=out.device, dtype=out.dtype)
         pos_enc = pos_enc.repeat(B, 1, 1).reshape(B * H, -1) 
         out = out + pos_enc
         out = self.activation(self.W2(out, cat_ids))         
@@ -136,7 +136,7 @@ class BasicTransformerBlock(nn.Module):
         x2 = self.norm2(x)
 
         if time_emb is not None:
-            x2 = x2 + time_emb.unsqueeze(1)
+            x2 = x2 + time_emb.to(dtype=x2.dtype).unsqueeze(1)
         ff_out = self.ff(x2)
         x = x + ff_out
         return x
