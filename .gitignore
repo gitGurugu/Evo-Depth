@@ -1,5 +1,11 @@
 LIBERO-evaluation/logs/
+LIBERO-evaluation/.venv-libero/
+LIBERO-evaluation/LIBERO/
 LIBERO-PLUS-evaluation/logs/
+LIBERO-PLUS-evaluation/.venv-libero-plus/
+LIBERO-PLUS-evaluation/LIBERO-plus/
 __pycache__/
 .venv/
+data/
+checkpoints/
 AGENTS.local.md
