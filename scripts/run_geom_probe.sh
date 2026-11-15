@@ -104,4 +104,4 @@ domestic \
     --ckpt "$CKPT" \
     --out "$OUT"
 
-log "Done. ${OUT}"
+log "Done. ${OUT}, depth tensors (.npz/.pt/_depth_tensors/*.npy), PNGs in ${OUT%.json}_depth_vis/"

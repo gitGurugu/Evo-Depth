@@ -1,8 +1,8 @@
 """A vs B geometry probe.
 
 A: pretrained da3-base. B: same heads, Evo checkpoint backbone only.
-Simulator intrinsics and extrinsics are the comparison target and the lift
-for the point cloud. They are not passed into the network.
+Network never sees simulator cameras (no cam_enc token).
+Simulator K/E are only used after inference to Sim(3)-scale relative depth to metres.
 """
 
 import argparse
@@ -98,32 +98,151 @@ class GeomProbe:
         n_loaded = self._load_backbone(B, ckpt)
         print(f"B backbone tensors loaded: {n_loaded}")
 
-        rows = {"A": [], "B": []}
+        modes = ("relative_median", "pose_scale_metric")
+        rows = {mode: {"A": [], "B": []} for mode in modes}
+        pred_depth = {mode: {"A": [], "B": []} for mode in modes}
+        gt_depth = []
         for i in range(len(data["images"])):
             pair = [data["images"][i, 0], data["images"][i, 1]]
             gt_d = data["depths"][i]
-            gt_k = data["intrinsics"][i]
-            gt_e = data["extrinsics"][i]
+            gt_k = np.asarray(data["intrinsics"][i], np.float32)
+            w2c = self._c2w_to_w2c(data["extrinsics"][i])
+            gt_resized = None
             for name, model in (("A", A), ("B", B)):
                 pred = model.inference(pair, process_res=self.process_res)
                 ph, pw = pred.depth.shape[-2:]
                 oh, ow = gt_d.shape[-2:]
-                # ponytail: square dump, so one resize matches upper_bound_resize onto 504
-                dmetrics = [
-                    self.depth_metrics(
-                        pred.depth[v],
-                        cv2.resize(gt_d[v], (pw, ph), interpolation=cv2.INTER_NEAREST),
+                if gt_resized is None:
+                    gt_resized = np.stack(
+                        [cv2.resize(gt_d[v], (pw, ph), interpolation=cv2.INTER_NEAREST) for v in range(2)]
                     )
-                    for v in range(2)
-                ]
-                cmetrics = self.camera_metrics(pred.intrinsics, pred.extrinsics, gt_k, gt_e, (ph, pw), (oh, ow))
-                rows[name].append(self._merge(dmetrics, cmetrics))
-        summary = {name: self._mean_rows(rows[name]) for name in ("A", "B")}
-        summary["B_minus_A"] = {k: summary["B"][k] - summary["A"][k] for k in summary["A"]}
-        print(json.dumps(summary, indent=2))
+                    gt_depth.append(gt_resized)
+                metric_depth, pose_s = self._relative_to_metric(pred.depth, pred.extrinsics, w2c)
+                cmetrics = self.camera_metrics(
+                    pred.intrinsics, pred.extrinsics, gt_k, w2c, (ph, pw), (oh, ow)
+                )
+                packed = (
+                    ("relative_median", pred.depth, "median"),
+                    ("pose_scale_metric", metric_depth, "none"),
+                )
+                for mode, depth, align in packed:
+                    dmetrics = []
+                    maps = []
+                    for v in range(2):
+                        m = self.depth_metrics(depth[v], gt_resized[v], align=align)
+                        m["pose_scale"] = pose_s
+                        dmetrics.append(m)
+                        maps.append(np.asarray(depth[v], np.float32) * np.float32(m["scale"]))
+                    pred_depth[mode][name].append(np.stack(maps))
+                    rows[mode][name].append(self._merge(dmetrics, cmetrics))
+        summary = {}
+        for mode in modes:
+            summary[mode] = {name: self._mean_rows(rows[mode][name]) for name in ("A", "B")}
+            summary[mode]["B_minus_A"] = {
+                k: summary[mode]["B"][k] - summary[mode]["A"][k] for k in summary[mode]["A"]
+            }
+            summary[mode]["frames"] = rows[mode]
+        print(self._format_table(summary["relative_median"], "relative_median: no cam token; median vs GT"))
+        print()
+        print(
+            self._format_table(
+                summary["pose_scale_metric"],
+                "pose_scale_metric: still no cam token; Umeyama vs simulator E then metres vs GT",
+            )
+        )
+        slim = {mode: {k: summary[mode][k] for k in ("A", "B", "B_minus_A")} for mode in modes}
+        print(json.dumps(slim, indent=2))
         with open(out, "w", encoding="utf-8") as f:
             json.dump(summary, f, indent=2)
+        tensors = {
+            "gt": np.stack(gt_depth).astype(np.float32),
+            "relative_A": np.stack(pred_depth["relative_median"]["A"]).astype(np.float32),
+            "relative_B": np.stack(pred_depth["relative_median"]["B"]).astype(np.float32),
+            "metric_A": np.stack(pred_depth["pose_scale_metric"]["A"]).astype(np.float32),
+            "metric_B": np.stack(pred_depth["pose_scale_metric"]["B"]).astype(np.float32),
+            "task_ids": np.asarray(data["task_ids"], np.int32),
+        }
+        stem = os.path.splitext(out)[0]
+        depth_out = stem + "_depth.npz"
+        depth_pt = stem + "_depth.pt"
+        tensor_dir = stem + "_depth_tensors"
+        np.savez_compressed(depth_out, **tensors)
+        os.makedirs(tensor_dir, exist_ok=True)
+        torch.save({k: torch.from_numpy(v.copy()) for k, v in tensors.items()}, depth_pt)
+        print("depth tensors (N, 2, H, W) metres except task_ids")
+        for key, arr in tensors.items():
+            np.save(os.path.join(tensor_dir, f"{key}.npy"), arr)
+            if key == "task_ids":
+                print(f"  {key:12} {arr.shape} {arr}")
+                continue
+            print(
+                f"  {key:12} {tuple(arr.shape)} {arr.dtype}  "
+                f"min {arr.min():.4f}  med {np.median(arr):.4f}  max {arr.max():.4f}"
+            )
+        vis_dir = stem + "_depth_vis"
+        self._write_depth_vis(
+            vis_dir,
+            data["images"],
+            data["task_ids"],
+            gt_depth,
+            pred_depth,
+        )
         print(f"wrote {out}")
+        print(f"wrote {depth_out}")
+        print(f"wrote {depth_pt}")
+        print(f"wrote npy tensors under {tensor_dir}")
+        print(f"wrote depth maps under {vis_dir}")
+
+    @staticmethod
+    def _colorize_depth(depth, vmin, vmax):
+        import cv2
+
+        x = np.clip((np.asarray(depth, np.float32) - vmin) / (vmax - vmin + 1e-8), 0, 1)
+        return cv2.applyColorMap((x * 255).astype(np.uint8), cv2.COLORMAP_MAGMA)
+
+    @staticmethod
+    def _label(img, text):
+        import cv2
+
+        out = img.copy()
+        cv2.putText(out, text, (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
+        return out
+
+    def _write_depth_vis(self, vis_dir, images, task_ids, gt_depth, pred_depth):
+        import cv2
+
+        os.makedirs(vis_dir, exist_ok=True)
+        rel_a = pred_depth["relative_median"]["A"]
+        rel_b = pred_depth["relative_median"]["B"]
+        met_a = pred_depth["pose_scale_metric"]["A"]
+        met_b = pred_depth["pose_scale_metric"]["B"]
+        names = ("rgb", "gt_m", "A_rel_m", "B_rel_m", "A_pose_m", "B_pose_m")
+        for i, tid in enumerate(task_ids):
+            rows = []
+            for v, cam in enumerate(("agent", "wrist")):
+                gt = gt_depth[i][v]
+                vmin, vmax = np.percentile(gt, 2), np.percentile(gt, 98)
+                if vmax <= vmin:
+                    vmax = vmin + 1e-6
+                rgb = cv2.resize(np.ascontiguousarray(images[i, v]), (gt.shape[1], gt.shape[0]))
+                if rgb.ndim == 2:
+                    rgb = cv2.cvtColor(rgb, cv2.COLOR_GRAY2BGR)
+                else:
+                    rgb = rgb[..., ::-1].copy()
+                cells = [
+                    rgb,
+                    self._colorize_depth(gt, vmin, vmax),
+                    self._colorize_depth(rel_a[i][v], vmin, vmax),
+                    self._colorize_depth(rel_b[i][v], vmin, vmax),
+                    self._colorize_depth(met_a[i][v], vmin, vmax),
+                    self._colorize_depth(met_b[i][v], vmin, vmax),
+                ]
+                cells = [self._label(c, f"{cam} {n}") for c, n in zip(cells, names)]
+                rows.append(np.concatenate(cells, axis=1))
+            panel = np.concatenate(rows, axis=0)
+            path = os.path.join(vis_dir, f"task_{int(tid):04d}.png")
+            cv2.imwrite(path, panel)
+            print(f"depth map {path}")
 
     def _load_backbone(self, model, ckpt):
         import torch
@@ -151,19 +270,48 @@ class GeomProbe:
         return len(bb)
 
     @staticmethod
-    def depth_metrics(pred, gt):
+    def _c2w_to_w2c(ext):
+        return np.linalg.inv(GeomProbe._as_h44(ext)).astype(np.float32)
+
+    @staticmethod
+    def _relative_to_metric(pred_depth, pred_ext, gt_w2c):
+        from model.depth_anything_3.utils.pose_align import align_poses_umeyama
+
+        _, _, scale, _ = align_poses_umeyama(
+            np.asarray(pred_ext),
+            np.asarray(gt_w2c),
+            ransac=False,
+            return_aligned=True,
+            random_state=42,
+        )
+        scale = float(scale)
+        if abs(scale) < 1e-8:
+            raise SystemExit("Umeyama pose scale is degenerate")
+        return np.asarray(pred_depth, np.float64) / scale, scale
+
+    @staticmethod
+    def depth_metrics(pred, gt, align="median"):
         pred = np.asarray(pred, np.float64)
         gt = np.asarray(gt, np.float64)
         m = np.isfinite(pred) & np.isfinite(gt) & (pred > 1e-6) & (gt > 1e-3)
         if m.sum() < 10:
             raise SystemExit("too few valid depth pixels")
-        scale = np.median(gt[m]) / np.median(pred[m])
+        median_factor = float(np.median(gt[m]) / np.median(pred[m]))
+        if align == "median":
+            scale = median_factor
+        elif align == "none":
+            scale = 1.0
+        else:
+            raise SystemExit(f"unknown depth align {align}")
         aligned = pred * scale
         ratio = np.maximum(aligned[m] / gt[m], gt[m] / aligned[m])
+        err = aligned[m] - gt[m]
         return {
-            "absrel": float(np.mean(np.abs(aligned[m] - gt[m]) / gt[m])),
+            "absrel": float(np.mean(np.abs(err) / gt[m])),
             "delta1": float(np.mean(ratio < 1.25)),
+            "rmse": float(np.sqrt(np.mean(err * err))),
             "scale": float(scale),
+            "median_factor": median_factor,
         }
 
     @staticmethod
@@ -171,16 +319,20 @@ class GeomProbe:
         ph, pw = proc_hw
         _, ow = orig_hw
         sx = pw / ow
-        fx = []
-        for v in range(2):
-            fx.append(abs(pred_k[v, 0, 0] - gt_k[v, 0, 0] * sx) / (abs(gt_k[v, 0, 0] * sx) + 1e-8))
+        out = {}
+        rel_err = []
+        for v, cam in enumerate(("agent", "wrist")):
+            pred_fx = float(pred_k[v, 0, 0])
+            gt_fx = float(gt_k[v, 0, 0] * sx)
+            out[f"pred_fx_{cam}"] = pred_fx
+            out[f"gt_fx_{cam}"] = gt_fx
+            rel_err.append(abs(pred_fx - gt_fx) / (abs(gt_fx) + 1e-8))
         rel_p = GeomProbe._relative(GeomProbe._as_h44(pred_e))
         rel_g = GeomProbe._relative(GeomProbe._as_h44(gt_e))
-        return {
-            "fx_err": float(np.mean(fx)),
-            "rot_deg": GeomProbe._rot_deg(rel_p[:3, :3], rel_g[:3, :3]),
-            "trans_deg": GeomProbe._trans_deg(rel_p[:3, 3], rel_g[:3, 3]),
-        }
+        out["fx_err"] = float(np.mean(rel_err))
+        out["rot_deg"] = GeomProbe._rot_deg(rel_p[:3, :3], rel_g[:3, :3])
+        out["trans_deg"] = GeomProbe._trans_deg(rel_p[:3, 3], rel_g[:3, 3])
+        return out
 
     @staticmethod
     def _as_h44(ext):
@@ -212,9 +364,39 @@ class GeomProbe:
 
     @staticmethod
     def _merge(dmetrics, cmetrics):
-        row = {k: float(np.mean([d[k] for d in dmetrics])) for k in ("absrel", "delta1")}
+        keys = ("absrel", "delta1", "rmse", "scale", "median_factor", "pose_scale")
+        row = {k: float(np.mean([d[k] for d in dmetrics])) for k in keys}
+        for cam, d in zip(("agent", "wrist"), dmetrics):
+            for k in keys:
+                row[f"{cam}_{k}"] = float(d[k])
         row.update(cmetrics)
         return row
+
+    @staticmethod
+    def _format_table(summary, title):
+        a, b = summary["A"], summary["B"]
+        lines = [
+            title,
+            f"{'':12} {'absrel':>8} {'delta1':>8} {'rmse_m':>8} {'med_s':>8}",
+        ]
+        for tag, row in (("A mean", a), ("A agent", a), ("A wrist", a), ("B mean", b), ("B agent", b), ("B wrist", b)):
+            if "mean" in tag:
+                keys = ("absrel", "delta1", "rmse", "median_factor")
+            elif "agent" in tag:
+                keys = ("agent_absrel", "agent_delta1", "agent_rmse", "agent_median_factor")
+            else:
+                keys = ("wrist_absrel", "wrist_delta1", "wrist_rmse", "wrist_median_factor")
+            lines.append(
+                f"{tag:12} {row[keys[0]]:8.3f} {row[keys[1]]:8.3f} {row[keys[2]]:8.3f} {row[keys[3]]:8.3f}"
+            )
+        lines += [
+            "",
+            "focal length px at 504 (GT is 256 fx * 504/256)",
+            f"{'':12} {'gt':>8} {'A':>8} {'B':>8}",
+            f"{'agent':12} {a['gt_fx_agent']:8.1f} {a['pred_fx_agent']:8.1f} {b['pred_fx_agent']:8.1f}",
+            f"{'wrist':12} {a['gt_fx_wrist']:8.1f} {a['pred_fx_wrist']:8.1f} {b['pred_fx_wrist']:8.1f}",
+        ]
+        return "\n".join(lines)
 
     @staticmethod
     def _mean_rows(rows):
@@ -225,6 +407,9 @@ class GeomProbe:
         gt = np.arange(1, 17, dtype=np.float32).reshape(4, 4)
         m = self.depth_metrics(gt / 2, gt)
         assert m["absrel"] < 1e-6 and abs(m["delta1"] - 1) < 1e-6 and abs(m["scale"] - 2) < 1e-6
+        assert m["rmse"] < 1e-6
+        raw = self.depth_metrics(gt, gt, align="none")
+        assert raw["absrel"] < 1e-6 and abs(raw["scale"] - 1) < 1e-6
 
         k = np.eye(3)
         k[0, 0] = k[1, 1] = 100.0
