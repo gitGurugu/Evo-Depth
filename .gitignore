@@ -1,3 +1,5 @@
 LIBERO-evaluation/logs/
 LIBERO-PLUS-evaluation/logs/
 __pycache__/
+.venv/
+AGENTS.local.md
