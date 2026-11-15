@@ -192,7 +192,12 @@ async def run(SERVER_URL: str, max_steps: int = None, num_episodes: int = None, 
     total_episodes = 0
     total_steps = 0
 
-    async with websockets.connect(SERVER_URL) as ws:
+    async with websockets.connect(
+        SERVER_URL,
+        max_size=100_000_000,
+        ping_interval=None,
+        ping_timeout=None,
+    ) as ws:
         log.info(f"===========================Start task suite {task_suite_name}========================")
         log.info(f"Horizon is {horizon}")
         total_false = 0
