@@ -9,10 +9,10 @@ import math
 import imageio
 import random
 import argparse
+os.environ["MUJOCO_GL"] = "osmesa"
 from tqdm import tqdm
 from libero.libero import benchmark, get_libero_path
 from libero.libero.envs import OffScreenRenderEnv
-os.environ["MUJOCO_GL"] = "osmes"
 
 LIBERO_DUMMY_ACTION = [0.0] * 6 + [0.0]
 
