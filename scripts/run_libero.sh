@@ -50,20 +50,26 @@ cleanup() {
 }
 trap cleanup EXIT
 
+port_open() {
+  "$SERVER_PY" -c 'import socket,sys; s=socket.socket(); r=s.connect_ex(("127.0.0.1", int(sys.argv[1]))); s.close(); raise SystemExit(0 if r==0 else 1)' "$1"
+}
+
 log "Start server for ${SUITE}"
 domestic \
   HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}" \
   HF_HUB_DISABLE_XET=1 \
+  PYTHONUNBUFFERED=1 \
   EVO_DEPTH_CKPT_DIR="$CKPT" \
   EVO_DEPTH_SERVER_PORT="$PORT" \
-  nohup "$SERVER_PY" scripts/Evo_depth_server.py \
+  nohup "$SERVER_PY" -u scripts/Evo_depth_server.py \
   >"$SERVER_LOG" 2>&1 &
 server_pid=$!
 echo "$server_pid" >"$PID_FILE"
 
 ready=0
 for ((i=0; i<360; i++)); do
-  if grep -q "Evo_depth server running" "$SERVER_LOG"; then
+  # Log line can lag under buffering; port listen means model load + websockets.serve finished.
+  if grep -q "Evo_depth server running" "$SERVER_LOG" 2>/dev/null || port_open "$PORT"; then
     ready=1
     break
   fi
