@@ -42,8 +42,10 @@ mkdir -p "$LOG_DIR"
 cd "$ROOT/Evo_depth"
 server_pid=""
 cleanup() {
-  if [[ -n "$server_pid" ]] && kill -0 "$server_pid" 2>/dev/null; then
+  if [[ -n "$server_pid" ]]; then
     kill "$server_pid" 2>/dev/null || true
+    # $! may be a short-lived wrapper; also reap its children.
+    pkill -P "$server_pid" 2>/dev/null || true
     wait "$server_pid" 2>/dev/null || true
   fi
   rm -f "$PID_FILE"
@@ -55,13 +57,14 @@ port_open() {
 }
 
 log "Start server for ${SUITE}"
+# No nohup: otherwise a missed cleanup leaves an orphan holding $PORT.
 domestic \
   HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}" \
   HF_HUB_DISABLE_XET=1 \
   PYTHONUNBUFFERED=1 \
   EVO_DEPTH_CKPT_DIR="$CKPT" \
   EVO_DEPTH_SERVER_PORT="$PORT" \
-  nohup "$SERVER_PY" -u scripts/Evo_depth_server.py \
+  "$SERVER_PY" -u scripts/Evo_depth_server.py \
   >"$SERVER_LOG" 2>&1 &
 server_pid=$!
 echo "$server_pid" >"$PID_FILE"
