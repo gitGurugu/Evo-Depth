@@ -274,19 +274,21 @@ class GeomProbe:
         return np.linalg.inv(GeomProbe._as_h44(ext)).astype(np.float32)
 
     @staticmethod
-    def _relative_to_metric(pred_depth, pred_ext, gt_w2c):
-        from model.depth_anything_3.utils.pose_align import align_poses_umeyama
+    def _camera_centers(w2c):
+        c2w = np.linalg.inv(GeomProbe._as_h44(w2c))
+        return c2w[:, :3, 3]
 
-        _, _, scale, _ = align_poses_umeyama(
-            np.asarray(pred_ext),
-            np.asarray(gt_w2c),
-            ransac=False,
-            return_aligned=True,
-            random_state=42,
-        )
-        scale = float(scale)
-        if abs(scale) < 1e-8:
-            raise SystemExit("Umeyama pose scale is degenerate")
+    @staticmethod
+    def _relative_to_metric(pred_depth, pred_ext, gt_w2c):
+        # Two views: Umeyama Sim(3) is rank-deficient. Scale by baseline length.
+        pred_c = GeomProbe._camera_centers(pred_ext)
+        gt_c = GeomProbe._camera_centers(gt_w2c)
+        pred_base = float(np.linalg.norm(pred_c[1] - pred_c[0]))
+        gt_base = float(np.linalg.norm(gt_c[1] - gt_c[0]))
+        if pred_base < 1e-8 or gt_base < 1e-8:
+            print("warn: degenerate two-view baseline, skip pose scale (s=1)")
+            return np.asarray(pred_depth, np.float64), 1.0
+        scale = pred_base / gt_base
         return np.asarray(pred_depth, np.float64) / scale, scale
 
     @staticmethod
