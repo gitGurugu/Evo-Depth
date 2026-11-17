@@ -2,11 +2,13 @@
 # LiteGauss LIBERO training (batch size 1). Does not touch Evo train.sh.
 #
 #   bash scripts/run_litegauss_train.sh --selfcheck
-#   bash scripts/run_litegauss_train.sh
-#   bash scripts/run_litegauss_train.sh --steps 100 --output checkpoints/litegauss/run1.pt
-#   DATASET_CONFIG=/path/to/config.libero.yaml bash scripts/run_litegauss_train.sh
+#   bash scripts/run_litegauss_train.sh --name run1-1k --steps 1000
+#   bash scripts/run_litegauss_train.sh --name smoke --steps 100
+#   DATASET_CONFIG=/path/to/config.libero.yaml bash scripts/run_litegauss_train.sh --name x --steps 100
 #
+# Checkpoint dir: checkpoints/litegauss/<name>/{config.json,norm_stats.json,model.pt}
 # Needs: setup_train_server.sh (.venv), setup_dataset.sh (config + data) for real runs.
+# See scripts/litegauss_train.md for full command recipes.
 
 set -euo pipefail
 
@@ -16,9 +18,15 @@ DATASET_CONFIG="${DATASET_CONFIG:-$ROOT/Evo_depth/dataset/config.libero.yaml}"
 STEPS="${STEPS:-100}"
 OUTPUT="${OUTPUT:-}"
 CONFIG_JSON="${CONFIG_JSON:-}"
+RUN_NAME="${RUN_NAME:-${SWANLAB_RUN:-}}"
+SWANLAB_PROJECT="${SWANLAB_PROJECT:-litegauss}"
 SELFCHECK=0
+NO_SWANLAB=0
 export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
 export HF_HUB_DISABLE_XET=1
+export SWANLAB_MODE="${SWANLAB_MODE:-cloud}"
+# swanlab 0.10 + some wandb installs; harmless if unused
+export PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION="${PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION:-python}"
 
 log() { printf '\n==> %s\n' "$*"; }
 # CompShare boxes often set a dead cluster proxy; strip it for HF/github pulls.
@@ -27,15 +35,29 @@ domestic() {
       -u all_proxy -u ALL_PROXY "$@"
 }
 
+# Safe checkpoint / SwanLab slug: keep alnum, dash, underscore, dot.
+sanitize_name() {
+  local raw="$1"
+  local out
+  out="$(printf '%s' "$raw" | tr -c 'A-Za-z0-9._-' '_')"
+  out="${out##_}"
+  out="${out%%_}"
+  [[ -n "$out" ]] || out="litegauss"
+  printf '%s' "$out"
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --selfcheck) SELFCHECK=1; shift ;;
     --steps) STEPS="$2"; shift 2 ;;
     --output) OUTPUT="$2"; shift 2 ;;
+    --name|--run-name) RUN_NAME="$2"; shift 2 ;;
+    --swanlab-project) SWANLAB_PROJECT="$2"; shift 2 ;;
+    --no-swanlab) NO_SWANLAB=1; shift ;;
     --dataset_config_path) DATASET_CONFIG="$2"; shift 2 ;;
     --config) CONFIG_JSON="$2"; shift 2 ;;
     -h|--help)
-      sed -n '2,12p' "$0"
+      sed -n '2,14p' "$0"
       exit 0
       ;;
     *) echo "unknown arg: $1" >&2; exit 1 ;;
@@ -61,21 +83,36 @@ fi
   exit 1
 }
 
+if [[ -z "$RUN_NAME" ]]; then
+  RUN_NAME="litegauss-steps${STEPS}"
+fi
+RUN_NAME="$(sanitize_name "$RUN_NAME")"
+if [[ -z "$OUTPUT" ]]; then
+  OUTPUT="$ROOT/checkpoints/litegauss/${RUN_NAME}"
+fi
+if [[ -e "$OUTPUT" ]]; then
+  echo "checkpoint path already exists (refusing overwrite): $OUTPUT" >&2
+  exit 1
+fi
+
 cmd=(
   domestic
   HF_ENDPOINT="$HF_ENDPOINT"
   HF_HUB_DISABLE_XET=1
   HF_HOME="${HF_HOME:-$HOME/.cache/huggingface}"
+  SWANLAB_MODE="$SWANLAB_MODE"
   "$PY" Evo_depth/scripts/train_litegauss_libero.py
   --dataset_config_path "$DATASET_CONFIG"
   --steps "$STEPS"
+  --output "$OUTPUT"
+  --swanlab-project "$SWANLAB_PROJECT"
+  --swanlab-run "$RUN_NAME"
 )
 [[ -n "$CONFIG_JSON" ]] && cmd+=(--config "$CONFIG_JSON")
-if [[ -n "$OUTPUT" ]]; then
-  mkdir -p "$(dirname "$OUTPUT")"
-  cmd+=(--output "$OUTPUT")
-fi
+[[ "$NO_SWANLAB" -eq 1 ]] && cmd+=(--no-swanlab)
 
-log "LiteGauss train steps=$STEPS config=$DATASET_CONFIG HF_ENDPOINT=$HF_ENDPOINT"
+mkdir -p "$(dirname "$OUTPUT")"
+
+log "LiteGauss train name=$RUN_NAME steps=$STEPS output=$OUTPUT project=$SWANLAB_PROJECT HF_ENDPOINT=$HF_ENDPOINT"
 "${cmd[@]}"
-log "Done."
+log "Done. checkpoint dir=$OUTPUT (config.json, norm_stats.json, model.pt)"

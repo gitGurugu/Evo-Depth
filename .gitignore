@@ -7,5 +7,6 @@ LIBERO-PLUS-evaluation/LIBERO-plus/
 __pycache__/
 .venv/
 data/
+cache/
 checkpoints/
 AGENTS.local.md
