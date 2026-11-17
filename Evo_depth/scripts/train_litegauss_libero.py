@@ -1,8 +1,9 @@
 """LiteGauss LIBERO training (Evo-aligned optimizer steps).
 
-Each --steps update averages loss over --batch_size samples (default 16), matching
-Evo train.sh: DataLoader shuffle + one optimizer.step per batch. The policy still
-runs micro-batch size 1 (like Evo's per-sample VL encode loop).
+Each update uses one true sample batch: one policy forward/backward/optimizer step.
+--batch-size (alias --batch_size) defaults to 16. --probe-max-batch searches for the
+largest true batch up to that limit with full-length text and forward/backward/
+AdamW workspace, lowering B on CUDA OOM. DA3 remains image-independent.
 
 Real example (paths must exist):
   python Evo_depth/scripts/train_litegauss_libero.py --dataset_config_path DATA.yaml --steps 2
@@ -15,6 +16,7 @@ Checkpoint directory layout (aligned with Evo server sidecars):
 """
 
 import argparse
+import gc
 import json
 import math
 import os
@@ -28,12 +30,111 @@ import torch
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
 
-from dataset.litegauss_loader import LiteGaussDataset, selfcheck
+from dataset.litegauss_loader import LiteGaussDataset, collate_litegauss, selfcheck
 
 
-def _collate_list(items):
-    """Keep samples as a python list; policy remains micro-batch 1."""
-    return items
+def probe_max_batch(policy, dataset, max_batch):
+    """Bounded integer binary search; full true batches, no parameter updates."""
+    ref = policy.litegauss.gst.queries
+    sample = dict(dataset[0])
+    # Fixed cameras/resolution; reserve the tokenizer's maximum text length.
+    sample["prompt"] = "probe " * policy.litegauss.max_text_len
+    parameters = [p for p in policy.parameters() if p.requires_grad]
+    optimizer = torch.optim.AdamW(parameters, lr=0.0, weight_decay=0.0)
+
+    def attempt(size):
+        batch = collate_litegauss([sample] * size)
+        loss = policy.train_step(**batch)
+        if not torch.isfinite(loss):
+            raise RuntimeError("non-finite probe loss")
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(parameters, 1.0, error_if_nonfinite=True)
+        # Allocate moments and include optimizer temporaries; lr=0 preserves weights.
+        optimizer.step()
+        torch.cuda.synchronize(ref.device)
+
+    high = min(max_batch, len(dataset))
+    candidate = high
+    try:
+        with torch.random.fork_rng(devices=[ref.device]):
+            try:
+                attempt(1)
+            except torch.cuda.OutOfMemoryError:
+                raise RuntimeError("True batch B=1 does not fit; reduce model/image/horizon configuration") from None
+            finally:
+                optimizer.zero_grad(set_to_none=True)
+            low = 1
+            while low < high:
+                torch.cuda.reset_peak_memory_stats(ref.device)
+                try:
+                    attempt(candidate)
+                except torch.cuda.OutOfMemoryError:
+                    fits = False
+                else:
+                    fits = True
+                finally:
+                    optimizer.zero_grad(set_to_none=True)
+                print(f"probe: B={candidate} {'fits' if fits else 'OOM'} "
+                      f"peak={torch.cuda.max_memory_allocated(ref.device) / 2**30:.3f} GiB")
+                gc.collect()
+                torch.cuda.empty_cache()
+                if fits:
+                    low = candidate
+                else:
+                    high = candidate - 1
+                candidate = (low + high + 1) // 2
+        print(f"probe: selected true batch_size={low} (requested upper bound={max_batch})")
+        return low
+    finally:
+        optimizer.zero_grad(set_to_none=True)
+        del optimizer
+        gc.collect()
+        torch.cuda.empty_cache()
+
+
+def check_probe(policy, sample):
+    """CPU simulation of CUDA OOM boundaries, using real batch forward/backward."""
+    from contextlib import nullcontext
+    from unittest.mock import patch
+
+    before = {name: p.detach().clone() for name, p in policy.named_parameters()}
+    real_step = policy.train_step
+    attempted = []
+
+    def limited_step(**batch):
+        size = batch["actions_gt"].shape[0]
+        attempted.append(size)
+        if size > 3:
+            raise torch.cuda.OutOfMemoryError("simulated capacity")
+        return real_step(**batch)
+
+    with torch.random.fork_rng(devices=[]), \
+         patch("torch.random.fork_rng", return_value=nullcontext()), \
+         patch.multiple(torch.cuda, synchronize=lambda *args: None,
+                        reset_peak_memory_stats=lambda *args: None,
+                        max_memory_allocated=lambda *args: 0, empty_cache=lambda: None), \
+         patch.object(policy, "train_step", side_effect=limited_step):
+        assert probe_max_batch(policy, [sample] * 8, 8) == 3
+        assert attempted == [1, 8, 4, 2, 3]
+        assert probe_max_batch(policy, [sample] * 8, 2) == 2
+        assert probe_max_batch(policy, [sample], 8) == 1
+        with patch.object(policy, "train_step", side_effect=torch.cuda.OutOfMemoryError("simulated")):
+            try:
+                probe_max_batch(policy, [sample], 1)
+            except RuntimeError as error:
+                assert "B=1 does not fit" in str(error)
+            else:
+                raise AssertionError("B=1 OOM must fail clearly")
+        with patch.object(policy, "train_step", side_effect=ValueError("bad input")):
+            try:
+                probe_max_batch(policy, [sample], 1)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("Probe must propagate non-OOM errors")
+    assert all(torch.equal(before[name], p) for name, p in policy.named_parameters())
+    assert all(p.grad is None for p in policy.parameters())
+    print("PASS: probe OOM search/top-fit/dataset cap/B=1 failure/non-OOM propagation; weights unchanged")
 
 
 def get_lr_lambda(warmup_steps, total_steps):
@@ -120,7 +221,10 @@ def main():
     parser.add_argument("--dataset_config_path", type=Path)
     parser.add_argument("--config", type=Path, help="Optional policy JSON")
     parser.add_argument("--steps", type=int, default=1, help="Optimizer steps (each uses batch_size samples)")
-    parser.add_argument("--batch_size", type=int, default=16, help="Samples per optimizer step (Evo train.sh default)")
+    parser.add_argument("--batch-size", "--batch_size", type=int, default=16,
+                        help="True samples per forward/backward/optimizer step (default: 16)")
+    parser.add_argument("--probe-max-batch", action="store_true",
+                        help="Before training, find largest true B <= --batch-size fitting CUDA VRAM; OOM lowers B")
     parser.add_argument("--lr", type=float, default=1e-4, help="Peak AdamW lr after warmup")
     parser.add_argument(
         "--warmup_steps",
@@ -147,11 +251,11 @@ def main():
     if args.selfcheck:
         if (args.dataset_config_path or args.config or args.output or args.steps != 1
                 or args.export_from_pt or args.batch_size != 16 or args.num_workers != 0
-                or args.lr != 1e-4 or args.warmup_steps != 1000):
+                or args.lr != 1e-4 or args.warmup_steps != 1000 or args.probe_max_batch):
             parser.error("--selfcheck cannot be combined with training arguments")
         batch = selfcheck()
         # Reuse the existing mocks, exercising the real GST/action head at 24 dims.
-        from train_litegauss import MockDepth, MockEmbedder
+        from train_litegauss import MockDepth, MockEmbedder, check_true_batch
         from model.litegauss.policy import LiteGaussPolicy
 
         policy = LiteGaussPolicy(dict(
@@ -172,11 +276,14 @@ def main():
         optimizer.step()
         assert not torch.equal(before, policy.litegauss.gst.queries)
         print(f"PASS: loader -> 24-dim policy loss/backward/optimizer; loss={loss.item():.6f}")
+        check_true_batch(policy, batch, {**batch, "state": batch["state"] + 0.25})
+        check_probe(policy, batch)
         return
 
     if args.export_from_pt is not None:
         if (args.steps != 1 or args.config or args.swanlab_run or args.no_swanlab
-                or args.batch_size != 16 or args.lr != 1e-4 or args.warmup_steps != 1000):
+                or args.batch_size != 16 or args.lr != 1e-4 or args.warmup_steps != 1000
+                or args.probe_max_batch):
             parser.error("--export-from-pt only uses --dataset_config_path and --output")
         if args.dataset_config_path is None or not args.dataset_config_path.is_file():
             parser.error("--dataset_config_path must name an existing file")
@@ -239,7 +346,7 @@ def main():
     dataset = LiteGaussDataset.from_config(dataset_config, action_horizon=horizon)
     if not len(dataset):
         raise ValueError("LIBERO dataset is empty")
-    if len(dataset) < args.batch_size:
+    if len(dataset) < args.batch_size and not args.probe_max_batch:
         raise ValueError(
             f"dataset length {len(dataset)} < batch_size {args.batch_size}; lower --batch_size"
         )
@@ -249,9 +356,10 @@ def main():
                               "num_categories": len(dataset_config["data_groups"])}).train()
     lr = args.lr
     warmup_steps = args.warmup_steps
+    batch_size = (probe_max_batch(policy, dataset, args.batch_size)
+                  if args.probe_max_batch else args.batch_size)
     optimizer = torch.optim.AdamW((p for p in policy.parameters() if p.requires_grad), lr=lr)
     scheduler = LambdaLR(optimizer, get_lr_lambda(warmup_steps, args.steps))
-    batch_size = args.batch_size
     run_name = args.swanlab_run or f"litegauss-steps{args.steps}"
     use_swanlab = (
         not args.no_swanlab
@@ -281,7 +389,7 @@ def main():
         batch_size=batch_size,
         shuffle=True,
         num_workers=args.num_workers,
-        collate_fn=_collate_list,
+        collate_fn=collate_litegauss,
         drop_last=True,
         persistent_workers=args.num_workers > 0,
     )
@@ -292,18 +400,13 @@ def main():
     )
     step = 0
     while step < args.steps:
-        for items in loader:
+        for batch in loader:
             if step >= args.steps:
                 break
             optimizer.zero_grad(set_to_none=True)
-            # Evo-style: encode/loss per sample, mean over the batch, one optimizer step.
-            losses = []
-            for item in items:
-                loss_i = policy.train_step(**item)
-                if not torch.isfinite(loss_i):
-                    raise RuntimeError("non-finite loss")
-                losses.append(loss_i)
-            loss = torch.stack(losses).mean()
+            loss = policy.train_step(**batch)
+            if not torch.isfinite(loss):
+                raise RuntimeError("non-finite loss")
             loss.backward()
             torch.nn.utils.clip_grad_norm_(
                 (p for p in policy.parameters() if p.requires_grad),

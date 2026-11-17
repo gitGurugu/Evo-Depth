@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
-# LiteGauss LIBERO training (Evo-aligned: default batch_size=16). Does not touch Evo train.sh.
+# LiteGauss LIBERO training (true batch_size=16). Does not touch Evo train.sh.
 #
 #   bash scripts/run_litegauss_train.sh --selfcheck
 #   bash scripts/run_litegauss_train.sh --name run2-5k --steps 5000
 #   bash scripts/run_litegauss_train.sh --name smoke --steps 100 --batch-size 16
+#   bash scripts/run_litegauss_train.sh --name auto --batch-size 64 --probe-max-batch
+# --probe-max-batch: find largest true B <= --batch-size fitting CUDA VRAM before training.
 #   DATASET_CONFIG=/path/to/config.libero.yaml bash scripts/run_litegauss_train.sh --name x --steps 100
 #
 # Checkpoint dir: checkpoints/litegauss/<name>/{config.json,norm_stats.json,model.pt}
@@ -25,6 +27,7 @@ RUN_NAME="${RUN_NAME:-${SWANLAB_RUN:-}}"
 SWANLAB_PROJECT="${SWANLAB_PROJECT:-litegauss}"
 SELFCHECK=0
 NO_SWANLAB=0
+PROBE_MAX_BATCH=0
 export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
 export HF_HUB_DISABLE_XET=1
 export SWANLAB_MODE="${SWANLAB_MODE:-cloud}"
@@ -54,6 +57,7 @@ while [[ $# -gt 0 ]]; do
     --selfcheck) SELFCHECK=1; shift ;;
     --steps) STEPS="$2"; shift 2 ;;
     --batch-size|--batch_size) BATCH_SIZE="$2"; shift 2 ;;
+    --probe-max-batch) PROBE_MAX_BATCH=1; shift ;;
     --lr) LR="$2"; shift 2 ;;
     --warmup-steps|--warmup_steps) WARMUP_STEPS="$2"; shift 2 ;;
     --output) OUTPUT="$2"; shift 2 ;;
@@ -63,7 +67,7 @@ while [[ $# -gt 0 ]]; do
     --dataset_config_path) DATASET_CONFIG="$2"; shift 2 ;;
     --config) CONFIG_JSON="$2"; shift 2 ;;
     -h|--help)
-      sed -n '2,14p' "$0"
+      sed -n '2,/^$/p' "$0"
       exit 0
       ;;
     *) echo "unknown arg: $1" >&2; exit 1 ;;
@@ -110,7 +114,7 @@ cmd=(
   "$PY" Evo_depth/scripts/train_litegauss_libero.py
   --dataset_config_path "$DATASET_CONFIG"
   --steps "$STEPS"
-  --batch_size "$BATCH_SIZE"
+  --batch-size "$BATCH_SIZE"
   --lr "$LR"
   --warmup_steps "$WARMUP_STEPS"
   --output "$OUTPUT"
@@ -119,6 +123,7 @@ cmd=(
 )
 [[ -n "$CONFIG_JSON" ]] && cmd+=(--config "$CONFIG_JSON")
 [[ "$NO_SWANLAB" -eq 1 ]] && cmd+=(--no-swanlab)
+[[ "$PROBE_MAX_BATCH" -eq 1 ]] && cmd+=(--probe-max-batch)
 
 mkdir -p "$(dirname "$OUTPUT")"
 

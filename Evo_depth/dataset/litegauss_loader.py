@@ -1,4 +1,4 @@
-"""Batch-one LIBERO adapter: padded LeRobot tensors -> LiteGaussPolicy kwargs.
+"""LIBERO adapter: padded LeRobot tensors -> LiteGaussPolicy kwargs.
 
 Run this file directly for a CPU fake-data selfcheck, without videos or weights.
 """
@@ -15,6 +15,24 @@ from PIL import Image
 from torch.utils.data import Dataset
 
 from model.litegauss.libero_intrinsics import default_libero_Ks
+
+
+def collate_litegauss(items):
+    """RGB [B][V], K [B,V,3,3], prompt [B], tensors [B,...]."""
+    if not items:
+        raise ValueError("Cannot collate an empty batch")
+    views = len(items[0]["rgb"])
+    sizes = [image.size for image in items[0]["rgb"]]
+    if not views or any(len(item["rgb"]) != views or len(item["K"]) != views
+                        or [image.size for image in item["rgb"]] != sizes for item in items):
+        raise ValueError("Batch samples must have the same cameras and image sizes")
+    return dict(
+        rgb=[item["rgb"] for item in items],
+        K=torch.stack([torch.stack([torch.as_tensor(k) for k in item["K"]]) for item in items]),
+        prompt=[item["prompt"] for item in items],
+        **{key: torch.cat([item[key] for item in items], dim=0)
+           for key in ("state", "actions_gt", "action_mask", "embodiment_id")},
+    )
 
 
 def _camera_order(config):
@@ -149,6 +167,15 @@ def selfcheck():
         except ValueError:
             return
         raise AssertionError("Invalid sample/config accepted")
+
+    collated = collate_litegauss([batch, batch])
+    assert collated["state"].shape == (2, 24)
+    assert collated["actions_gt"].shape == collated["action_mask"].shape == (2, 4, 24)
+    assert collated["K"].shape == (2, 2, 3, 3)
+    assert len(collated["rgb"]) == len(collated["prompt"]) == 2
+    rejects(lambda: collate_litegauss([]))
+    rejects(lambda: collate_litegauss([batch, {**batch, "rgb": batch["rgb"][:1]}]))
+    rejects(lambda: collate_litegauss([batch, {**batch, "rgb": [Image.new("RGB", (32, 32))] * 2}]))
 
     for key, bad in (("image_mask", torch.tensor([True, False, False])),
                      ("image_mask", torch.tensor([False, True, False])),

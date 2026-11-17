@@ -126,10 +126,12 @@ class BasicTransformerBlock(nn.Module):
             nn.Linear(hidden_dim, embed_dim)
         )
 
-    def forward(self, action_tokens: torch.Tensor, context_tokens: torch.Tensor, time_emb: torch.Tensor):
+    def forward(self, action_tokens: torch.Tensor, context_tokens: torch.Tensor, time_emb: torch.Tensor,
+                context_mask: torch.Tensor = None):
 
         x = self.norm1(action_tokens)
-        attn_out, _ = self.attn(x, context_tokens, context_tokens)
+        attn_out, _ = self.attn(x, context_tokens, context_tokens,
+                               key_padding_mask=None if context_mask is None else ~context_mask)
 
         x = action_tokens + attn_out
 
@@ -221,10 +223,12 @@ class FlowmatchingActionHead(nn.Module):
 
     def forward(self, fused_tokens: torch.Tensor, state: torch.Tensor = None,
                 actions_gt: torch.Tensor = None, embodiment_id: torch.LongTensor = None, 
-                state_mask: torch.Tensor = None, action_mask: torch.Tensor = None):
+                state_mask: torch.Tensor = None, action_mask: torch.Tensor = None,
+                context_mask: torch.Tensor = None):
 
         if actions_gt is None:
-            return self.get_action(fused_tokens, state=state, embodiment_id=embodiment_id)
+            return self.get_action(fused_tokens, state=state, embodiment_id=embodiment_id,
+                                   action_mask=action_mask, context_mask=context_mask)
         B = fused_tokens.size(0)
         device = fused_tokens.device
 
@@ -239,6 +243,8 @@ class FlowmatchingActionHead(nn.Module):
             state_emb = state_emb.unsqueeze(1) 
 
             context_tokens = torch.cat([context_tokens, state_emb], dim=1) 
+            if context_mask is not None:
+                context_mask = F.pad(context_mask, (0, 1), value=True)
 
         t = torch.distributions.Beta(2, 2).sample((B,)).clamp(0.02, 0.98).to(device).to(dtype=self.dtype)
 
@@ -267,10 +273,9 @@ class FlowmatchingActionHead(nn.Module):
         else:
             noise_seq = noise.unsqueeze(1)
 
-        if self.horizon > 1:
-            t_broadcast = t.view(B, 1, 1)
-        else:
-            t_broadcast = t.view(B, 1)
+        t_broadcast = t.view(B, 1, 1)
+        if self.horizon == 1:
+            actions_gt_seq = actions_gt.unsqueeze(1)
         action_intermediate_seq = (1 - t_broadcast) * noise_seq + t_broadcast * actions_gt_seq  
 
         if self.horizon > 1 and self.action_encoder is not None:
@@ -284,7 +289,7 @@ class FlowmatchingActionHead(nn.Module):
 
         x = action_tokens  
         for block in self.transformer_blocks:
-            x = block(x, context_tokens, time_emb)
+            x = block(x, context_tokens, time_emb, context_mask)
 
         x = self.norm_out(x)  
 
@@ -304,7 +309,7 @@ class FlowmatchingActionHead(nn.Module):
 
         return pred_velocity, noise
 
-    def get_action(self, fused_tokens: torch.Tensor, state: torch.Tensor = None, embodiment_id: torch.LongTensor = None, action_mask: torch.Tensor = None):
+    def get_action(self, fused_tokens: torch.Tensor, state: torch.Tensor = None, embodiment_id: torch.LongTensor = None, action_mask: torch.Tensor = None, context_mask: torch.Tensor = None):
 
         print(f"action_mask shape: {action_mask.shape if action_mask is not None else 'None'}")
         print(f"one sample action_mask: {action_mask[0] if action_mask is not None else 'None'}")
@@ -319,6 +324,8 @@ class FlowmatchingActionHead(nn.Module):
 
             state_emb = self.state_encoder(state, embodiment_id).unsqueeze(1) 
             context_tokens = torch.cat([context_tokens, state_emb], dim=1)
+            if context_mask is not None:
+                context_mask = F.pad(context_mask, (0, 1), value=True)
 
         action_dim_total = getattr(self.config, "action_dim", None)
         if action_dim_total is None:
@@ -378,7 +385,7 @@ class FlowmatchingActionHead(nn.Module):
 
             x = action_tokens
             for block in self.transformer_blocks:
-                x = block(x, context_tokens, time_emb)
+                x = block(x, context_tokens, time_emb, context_mask)
             x = self.norm_out(x)
 
             if self.horizon > 1:

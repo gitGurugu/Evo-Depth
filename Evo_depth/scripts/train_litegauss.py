@@ -76,8 +76,15 @@ class MockEmbedder(nn.Module):
         return torch.stack(pixels), [1] * len(images)
 
     def tokenizer(self, prompt, **kwargs):
-        ids = torch.tensor([[len(word) % 16 for word in prompt.split()] or [0]])
-        return {"input_ids": ids, "attention_mask": torch.ones_like(ids)}
+        prompts = [prompt] if isinstance(prompt, str) else prompt
+        rows = [[len(word) % 16 for word in text.split()][:kwargs.get("max_length", 128)] or [0]
+                for text in prompts]
+        ids = torch.zeros(len(rows), max(map(len, rows)), dtype=torch.long)
+        mask = torch.zeros_like(ids)
+        for i, row in enumerate(rows):
+            ids[i, :len(row)] = torch.tensor(row)
+            mask[i, :len(row)] = 1
+        return {"input_ids": ids, "attention_mask": mask}
 
 
 class MockDepth(nn.Module):
@@ -100,13 +107,81 @@ def dummy_batch(horizon=4, action_dim=3, state_dim=3):
                 actions_gt=torch.rand(1, horizon, action_dim) * 2 - 1, action_mask=mask)
 
 
+def check_true_batch(policy, first, second):
+    """Exercise collate -> one batched policy/head/backward, with independent samples."""
+    from unittest.mock import patch
+    from torch.utils.data import DataLoader
+    from dataset.litegauss_loader import collate_litegauss
+
+    second = {**second, "prompt": "move", "rgb": [Image.new("RGB", im.size, (17, 83, 149))
+                                                for im in second["rgb"]],
+              "embodiment_id": torch.tensor([min(1, policy.config.get("num_categories", 1) - 1)])}
+    batch = next(iter(DataLoader([first, second], batch_size=2, collate_fn=collate_litegauss)))
+    assert batch["state"].shape == (2, policy.state_dim)
+    assert batch["actions_gt"].shape == (2, policy.horizon, policy.per_action_dim)
+    assert batch["K"].shape == (2, len(first["rgb"]), 3, 3)
+    core = policy.litegauss
+    optimizer = torch.optim.AdamW((p for p in policy.parameters() if p.requires_grad), lr=1e-3)
+    optimizer.zero_grad(set_to_none=True)
+    before = core.gst.queries.detach().clone()
+    shapes, grads = [], []
+    hook = core.action_head.register_forward_pre_hook(lambda module, args: shapes.append(args[0].shape))
+    grad_hook = core.gst.queries.register_hook(lambda grad: grads.append(grad.detach().clone()))
+    with patch.object(policy, "train_step", wraps=policy.train_step) as train, \
+         patch.object(core.embedder.model, "extract_feature", wraps=core.embedder.model.extract_feature) as vit, \
+         patch.object(core.embedder.model.language_model, "forward", wraps=core.embedder.model.language_model.forward) as lm, \
+         patch.object(core.depth, "inference_images", wraps=core.depth.inference_images) as depth:
+        loss = policy.train_step(**batch)
+        assert loss.ndim == 0 and torch.isfinite(loss)
+        loss.backward()
+        assert train.call_count == vit.call_count == lm.call_count == 1
+        assert vit.call_args.args[0].shape[0] == 2 * len(first["rgb"])
+        assert lm.call_args.kwargs["input_ids"].shape[0] == 2
+        assert depth.call_count == 2 * len(first["rgb"])
+        assert all(len(call.args[0]) == 1 for call in depth.call_args_list)
+    hook.remove()
+    grad_hook.remove()
+    assert len(shapes) == len(grads) == 1 and shapes[0][0] == 2
+    assert torch.isfinite(grads[0]).all() and grads[0].abs().sum() > 0
+    optimizer.step()
+    assert not torch.equal(before, core.gst.queries)
+    optimizer.zero_grad(set_to_none=True)
+
+    with torch.no_grad():
+        _, _, context, mask = core.encode_context(batch["rgb"], batch["K"], batch["prompt"])
+        assert (~mask[1]).any()  # Different prompt lengths really exercise padding.
+        for i, sample in enumerate((first, second)):
+            _, _, single, _ = core.encode_context(sample["rgb"], sample["K"], sample["prompt"])
+            torch.testing.assert_close(context[i, mask[i]], single[0], atol=2e-5, rtol=2e-5)
+        one = collate_litegauss([first])
+        _, _, nested_one, _ = core.encode_context(one["rgb"], one["K"], one["prompt"])
+        _, _, old_one, _ = core.encode_context(first["rgb"], first["K"], first["prompt"])
+        torch.testing.assert_close(nested_one, old_one, rtol=0, atol=0)
+        changed = collate_litegauss([{**first, "rgb": second["rgb"], "prompt": "different instruction"}, second])
+        _, _, other_context, other_mask = core.encode_context(changed["rgb"], changed["K"], changed["prompt"])
+        torch.testing.assert_close(context[1, mask[1]], other_context[1, other_mask[1]])
+        # Padding values must not influence action cross-attention (including the state token).
+        padded = context.clone()
+        padded[~mask] = 123
+        head_args = dict(state=policy._state(batch["state"], 2),
+                         actions_gt=batch["actions_gt"] if policy.horizon > 1 else batch["actions_gt"][:, 0],
+                         context_mask=mask, embodiment_id=policy._ids(batch["embodiment_id"], 2))
+        torch.manual_seed(71)
+        expected = core.action_head(context, **head_args)[0]
+        torch.manual_seed(71)
+        actual = core.action_head(padded, **head_args)[0]
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    print(f"PASS: true B=2 collate/policy; ViT/LM/head once; DA3 single-image; one backward/update; isolation/padding/B=1 parity; loss={loss.item():.6f}")
+    return batch
+
+
 def smoke():
     torch.manual_seed(0)
     torch.set_num_threads(1)
     config = dict(device="cpu", embed_dim=16, hidden_dim=32, state_hidden_dim=16,
                   state_dim=3, horizon=4, per_action_dim=3, num_layers=1,
                   num_heads=2, pool_dim=16, gst_num_heads=2, num_queries=4,
-                  fourier_L=2, num_inference_timesteps=2)
+                  fourier_L=2, num_inference_timesteps=2, num_categories=2)
     policy = LiteGaussPolicy(config, embedder=MockEmbedder(16), depth=MockDepth()).train()
     frozen = {n: p.detach().clone() for n, p in policy.named_parameters() if not p.requires_grad}
     before = {n: p.detach().clone() for n, p in policy.named_parameters() if p.requires_grad}
@@ -181,7 +256,18 @@ def smoke():
     assert torch.isfinite(single_loss)
     single_loss.backward()
     assert single.litegauss.action_head.single_action_proj.weight.grad is not None
+    single_batched = dict(
+        rgb=[single_batch["rgb"], single_batch["rgb"]],
+        K=torch.stack([torch.stack(single_batch["K"])] * 2), prompt=["pick up cube", "move"],
+        actions_gt=single_batch["actions_gt"].repeat(2, 1, 1),
+        action_mask=single_batch["action_mask"].repeat(2, 1, 1), embodiment_id=torch.tensor([0, 1]),
+    )
+    single_batched_loss = single(**single_batched)
+    assert single_batched_loss.ndim == 0 and torch.isfinite(single_batched_loss)
+    single_batched_loss.backward()
     assert dummy_batch(action_dim=1)["action_mask"].sum() > 0
+    first = {**batch, "embodiment_id": torch.tensor([0])}
+    check_true_batch(policy, first, {**first, "state": first["state"] + 0.25})
     assert "model.internvl3.internvl3_embedder_da3" not in sys.modules
     assert "model.depth_anything_3.depth_anything_v3" not in sys.modules
     print(f"PASS: CPU smoke loss={loss.item():.6f}; one/two-view default LIBERO K; explicit K preserved; GST/action backward + optimizer; frozen backbones; masked inference")
