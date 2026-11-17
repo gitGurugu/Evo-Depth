@@ -56,6 +56,7 @@ The default server port is `9000`. Set `EVO_DEPTH_SERVER_PORT` and pass the matc
       - [2.2 Parquet cache directory](#22-parquet-cache-directory)
     - [3. Start training](#3-start-training)
       - [3.1 Accelerate and DeepSpeed](#31-accelerate-and-deepspeed)
+    - [4. LiteGauss training (GST + action head)](#4-litegauss-training-gst--action-head)
 
 ## Model architecture
 
@@ -395,3 +396,19 @@ bash train.sh
 ```
 
 For multi-GPU training, set `--num_processes` in `train.sh` to match your `accelerate config`. To resume in the middle of a stage, keep the same finetune flags as that stage and set `--resume --resume_path` to the target checkpoint directory, for example `.../step_20000`.
+
+### 4. LiteGauss training (GST + action head)
+
+LiteGauss freezes InternVL + DA3 and trains only the Gaussian Spatial Tokenizer and flow-matching action head on LIBERO-style data. Training is **step-based** (not epoch-based): each `--steps` update uses a **true batch** of `--batch-size` samples in one forward/backward. Optional `--probe-max-batch` searches for the largest true B that fits GPU memory up to the requested upper bound.
+
+```bash
+# From repo root (uses .venv). Full recipes: scripts/litegauss_train.md
+bash scripts/run_litegauss_train.sh --selfcheck
+bash scripts/run_litegauss_train.sh \
+  --swanlab-project Evo-LiteGauss \
+  --name run-bs192-5k \
+  --steps 5000 \
+  --batch-size 192
+```
+
+Checkpoints land in `checkpoints/litegauss/<name>/{config.json,norm_stats.json,model.pt}`. SwanLab project defaults to `litegauss` unless you pass `--swanlab-project`.
