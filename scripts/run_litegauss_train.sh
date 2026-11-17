@@ -17,8 +17,15 @@ STEPS="${STEPS:-100}"
 OUTPUT="${OUTPUT:-}"
 CONFIG_JSON="${CONFIG_JSON:-}"
 SELFCHECK=0
+export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
+export HF_HUB_DISABLE_XET=1
 
 log() { printf '\n==> %s\n' "$*"; }
+# CompShare boxes often set a dead cluster proxy; strip it for HF/github pulls.
+domestic() {
+  env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY \
+      -u all_proxy -u ALL_PROXY "$@"
+}
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -41,9 +48,9 @@ export PYTHONPATH="${PYTHONPATH:+$PYTHONPATH:}$ROOT/Evo_depth"
 if [[ "$SELFCHECK" -eq 1 ]]; then
   log "LiteGauss selfcheck (no data / no GPU weights required if using system torch)"
   if [[ -x "$PY" ]]; then
-    "$PY" Evo_depth/scripts/train_litegauss_libero.py --selfcheck
+    domestic "$PY" Evo_depth/scripts/train_litegauss_libero.py --selfcheck
   else
-    python Evo_depth/scripts/train_litegauss_libero.py --selfcheck
+    domestic python Evo_depth/scripts/train_litegauss_libero.py --selfcheck
   fi
   exit 0
 fi
@@ -55,6 +62,10 @@ fi
 }
 
 cmd=(
+  domestic
+  HF_ENDPOINT="$HF_ENDPOINT"
+  HF_HUB_DISABLE_XET=1
+  HF_HOME="${HF_HOME:-$HOME/.cache/huggingface}"
   "$PY" Evo_depth/scripts/train_litegauss_libero.py
   --dataset_config_path "$DATASET_CONFIG"
   --steps "$STEPS"
@@ -65,6 +76,6 @@ if [[ -n "$OUTPUT" ]]; then
   cmd+=(--output "$OUTPUT")
 fi
 
-log "LiteGauss train steps=$STEPS config=$DATASET_CONFIG"
+log "LiteGauss train steps=$STEPS config=$DATASET_CONFIG HF_ENDPOINT=$HF_ENDPOINT"
 "${cmd[@]}"
 log "Done."

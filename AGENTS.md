@@ -63,6 +63,24 @@ IPv4 `192.168.1.1` / `192.168.2.1` 从这台 PC 通常超时；用 IPv6 + 正确
 
 Password / other secrets: fill `AGENTS.local.md` (gitignored). Agents: read that file if present; never commit it.
 
+## Remote: LiteGauss
+
+SSH alias in `~/.ssh/config`: **`LiteGauss`**. Same key as `compshare` (`EVO.pem`).
+
+| Item | Value |
+|------|--------|
+| Alias | `ssh LiteGauss` |
+| User | `root` |
+| Host | `117.50.221.107` |
+| Port | `23` |
+| IdentityFile | `C:/Users/20494/.ssh/EVO.pem` |
+
+```powershell
+ssh LiteGauss
+# 或显式：
+ssh -p 23 -i C:/Users/20494/.ssh/EVO.pem root@117.50.221.107
+```
+
 ## Working rules
 
 - Smallest diff; reuse existing patterns
