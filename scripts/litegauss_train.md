@@ -1,11 +1,18 @@
 # LiteGauss 训练命令
 
-Batch size = 1。  
+与 Evo `train.sh` 对齐：
+
+- 默认 **`batch_size=16`**
+- 学习率：**线性 warmup（默认 1000 step）+ cosine 降到 0**（与 `Evo_depth/scripts/train.py` 相同公式）
+- 峰值 lr 默认 **`1e-4`**（只训 GST/action head；Evo 全模常用 `1e-5`）
+
+每个 `--steps` = 一次 optimizer 更新 = 平均 **16 条样本** 的 loss（内部仍按单条做 GST/encode，再 mean）。
+
 默认 checkpoint 目录：`checkpoints/litegauss/<代名词>/`
 
 ```text
 checkpoints/litegauss/<name>/
-  config.json       # 策略配置 + run 元数据
+  config.json       # 策略配置 + run 元数据（含 batch_size）
   norm_stats.json   # 与 Evo server 同款归一化统计（单 robot key）
   model.pt          # gst + action_head（+ optimizer）
 ```
@@ -28,24 +35,22 @@ bash scripts/run_litegauss_train.sh --selfcheck
 
 ## 常用训练
 
-冒烟 100 step：
+冒烟（默认 batch 16）：
 
 ```bash
 bash scripts/run_litegauss_train.sh --name smoke-100 --steps 100
-# -> checkpoints/litegauss/smoke-100/{config.json,norm_stats.json,model.pt}
+# 约看 100×16=1600 条样本
 ```
 
-第一版可测 ckpt（推荐）：
+推荐 5k step：
 
 ```bash
-bash scripts/run_litegauss_train.sh --name run1-1k --steps 1000
-# -> checkpoints/litegauss/run1-1k/
-```
-
-加长一点：
-
-```bash
-bash scripts/run_litegauss_train.sh --name run2-5k --steps 5000
+bash scripts/run_litegauss_train.sh \
+  --swanlab-project Evo-LiteGauss \
+  --name run2-5k \
+  --steps 5000
+# -> checkpoints/litegauss/run2-5k/
+# 约看 5000×16=80000 条样本（~0.29 epoch，数据约 27.5 万）
 ```
 
 ## 参数说明
@@ -53,31 +58,16 @@ bash scripts/run_litegauss_train.sh --name run2-5k --steps 5000
 | 参数 / 环境变量 | 作用 | 默认 |
 |-----------------|------|------|
 | `--name` / `--run-name` / `RUN_NAME` | 本次代名词（ckpt 目录名 + SwanLab run 名） | `litegauss-steps<N>` |
-| `--steps` / `STEPS` | 训练步数 | `100` |
+| `--steps` / `STEPS` | **optimizer 步数**（不是单样本次数） | `100` |
+| `--batch-size` / `BATCH_SIZE` | 每步样本数（对齐 Evo） | `16` |
+| `--lr` / `LR` | 峰值学习率 | `1e-4` |
+| `--warmup-steps` / `WARMUP_STEPS` | 线性 warmup，随后 cosine | `1000` |
 | `--output` | 手动指定 **checkpoint 目录** | `checkpoints/litegauss/<name>/` |
 | `--swanlab-project` / `SWANLAB_PROJECT` | SwanLab 项目 | `litegauss` |
 | `--no-swanlab` / `SWANLAB_MODE=disabled` | 关闭上传 | 默认 cloud |
 | `--dataset_config_path` | 数据配置 | `Evo_depth/dataset/config.libero.yaml` |
 
-同一次训练里：**代名词只设一次**。换实验就换 `--name`；目录已存在会拒绝覆盖。
-
-## 指定项目名示例
-
-```bash
-bash scripts/run_litegauss_train.sh \
-  --swanlab-project Evo-LiteGauss \
-  --name run1-1k \
-  --steps 1000
-```
-
-## 手动指定输出目录
-
-```bash
-bash scripts/run_litegauss_train.sh \
-  --name run1-1k \
-  --steps 1000 \
-  --output checkpoints/litegauss/custom/run1-1k
-```
+换实验就换 `--name`；目录已存在会拒绝覆盖。
 
 ## 旧版单文件 `.pt` 转目录
 

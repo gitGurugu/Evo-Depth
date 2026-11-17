@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# LiteGauss LIBERO training (batch size 1). Does not touch Evo train.sh.
+# LiteGauss LIBERO training (Evo-aligned: default batch_size=16). Does not touch Evo train.sh.
 #
 #   bash scripts/run_litegauss_train.sh --selfcheck
-#   bash scripts/run_litegauss_train.sh --name run1-1k --steps 1000
-#   bash scripts/run_litegauss_train.sh --name smoke --steps 100
+#   bash scripts/run_litegauss_train.sh --name run2-5k --steps 5000
+#   bash scripts/run_litegauss_train.sh --name smoke --steps 100 --batch-size 16
 #   DATASET_CONFIG=/path/to/config.libero.yaml bash scripts/run_litegauss_train.sh --name x --steps 100
 #
 # Checkpoint dir: checkpoints/litegauss/<name>/{config.json,norm_stats.json,model.pt}
@@ -16,6 +16,9 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PY="${LITEGAUSS_PY:-$ROOT/.venv/bin/python}"
 DATASET_CONFIG="${DATASET_CONFIG:-$ROOT/Evo_depth/dataset/config.libero.yaml}"
 STEPS="${STEPS:-100}"
+BATCH_SIZE="${BATCH_SIZE:-16}"
+LR="${LR:-1e-4}"
+WARMUP_STEPS="${WARMUP_STEPS:-1000}"
 OUTPUT="${OUTPUT:-}"
 CONFIG_JSON="${CONFIG_JSON:-}"
 RUN_NAME="${RUN_NAME:-${SWANLAB_RUN:-}}"
@@ -50,6 +53,9 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --selfcheck) SELFCHECK=1; shift ;;
     --steps) STEPS="$2"; shift 2 ;;
+    --batch-size|--batch_size) BATCH_SIZE="$2"; shift 2 ;;
+    --lr) LR="$2"; shift 2 ;;
+    --warmup-steps|--warmup_steps) WARMUP_STEPS="$2"; shift 2 ;;
     --output) OUTPUT="$2"; shift 2 ;;
     --name|--run-name) RUN_NAME="$2"; shift 2 ;;
     --swanlab-project) SWANLAB_PROJECT="$2"; shift 2 ;;
@@ -104,6 +110,9 @@ cmd=(
   "$PY" Evo_depth/scripts/train_litegauss_libero.py
   --dataset_config_path "$DATASET_CONFIG"
   --steps "$STEPS"
+  --batch_size "$BATCH_SIZE"
+  --lr "$LR"
+  --warmup_steps "$WARMUP_STEPS"
   --output "$OUTPUT"
   --swanlab-project "$SWANLAB_PROJECT"
   --swanlab-run "$RUN_NAME"
@@ -113,6 +122,6 @@ cmd=(
 
 mkdir -p "$(dirname "$OUTPUT")"
 
-log "LiteGauss train name=$RUN_NAME steps=$STEPS output=$OUTPUT project=$SWANLAB_PROJECT HF_ENDPOINT=$HF_ENDPOINT"
+log "LiteGauss train name=$RUN_NAME steps=$STEPS batch_size=$BATCH_SIZE lr=$LR warmup_steps=$WARMUP_STEPS output=$OUTPUT project=$SWANLAB_PROJECT"
 "${cmd[@]}"
 log "Done. checkpoint dir=$OUTPUT (config.json, norm_stats.json, model.pt)"

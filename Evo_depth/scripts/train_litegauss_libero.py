@@ -1,4 +1,8 @@
-"""Batch-one LiteGauss LIBERO training; --selfcheck needs no data or weights.
+"""LiteGauss LIBERO training (Evo-aligned optimizer steps).
+
+Each --steps update averages loss over --batch_size samples (default 16), matching
+Evo train.sh: DataLoader shuffle + one optimizer.step per batch. The policy still
+runs micro-batch size 1 (like Evo's per-sample VL encode loop).
 
 Real example (paths must exist):
   python Evo_depth/scripts/train_litegauss_libero.py --dataset_config_path DATA.yaml --steps 2
@@ -12,6 +16,7 @@ Checkpoint directory layout (aligned with Evo server sidecars):
 
 import argparse
 import json
+import math
 import os
 import sys
 from pathlib import Path
@@ -20,8 +25,27 @@ sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import torch
+from torch.optim.lr_scheduler import LambdaLR
+from torch.utils.data import DataLoader
 
 from dataset.litegauss_loader import LiteGaussDataset, selfcheck
+
+
+def _collate_list(items):
+    """Keep samples as a python list; policy remains micro-batch 1."""
+    return items
+
+
+def get_lr_lambda(warmup_steps, total_steps):
+    """Same schedule as Evo train.py: linear warmup, then cosine to 0."""
+
+    def lr_lambda(current_step):
+        if current_step < warmup_steps:
+            return current_step / max(1, warmup_steps)
+        progress = (current_step - warmup_steps) / max(1, total_steps - warmup_steps)
+        return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
+
+    return lr_lambda
 
 CKPT_FILES = ("config.json", "norm_stats.json", "model.pt")
 
@@ -95,7 +119,16 @@ def main():
     parser.add_argument("--selfcheck", action="store_true")
     parser.add_argument("--dataset_config_path", type=Path)
     parser.add_argument("--config", type=Path, help="Optional policy JSON")
-    parser.add_argument("--steps", type=int, default=1)
+    parser.add_argument("--steps", type=int, default=1, help="Optimizer steps (each uses batch_size samples)")
+    parser.add_argument("--batch_size", type=int, default=16, help="Samples per optimizer step (Evo train.sh default)")
+    parser.add_argument("--lr", type=float, default=1e-4, help="Peak AdamW lr after warmup")
+    parser.add_argument(
+        "--warmup_steps",
+        type=int,
+        default=1000,
+        help="Linear warmup steps (Evo train.sh default); cosine decay afterward",
+    )
+    parser.add_argument("--num_workers", type=int, default=0, help="DataLoader workers (0 is safest with video+CUDA)")
     parser.add_argument(
         "--output",
         type=Path,
@@ -113,7 +146,8 @@ def main():
     args = parser.parse_args()
     if args.selfcheck:
         if (args.dataset_config_path or args.config or args.output or args.steps != 1
-                or args.export_from_pt):
+                or args.export_from_pt or args.batch_size != 16 or args.num_workers != 0
+                or args.lr != 1e-4 or args.warmup_steps != 1000):
             parser.error("--selfcheck cannot be combined with training arguments")
         batch = selfcheck()
         # Reuse the existing mocks, exercising the real GST/action head at 24 dims.
@@ -141,7 +175,8 @@ def main():
         return
 
     if args.export_from_pt is not None:
-        if args.steps != 1 or args.config or args.swanlab_run or args.no_swanlab:
+        if (args.steps != 1 or args.config or args.swanlab_run or args.no_swanlab
+                or args.batch_size != 16 or args.lr != 1e-4 or args.warmup_steps != 1000):
             parser.error("--export-from-pt only uses --dataset_config_path and --output")
         if args.dataset_config_path is None or not args.dataset_config_path.is_file():
             parser.error("--dataset_config_path must name an existing file")
@@ -179,6 +214,14 @@ def main():
 
     if args.steps < 1:
         parser.error("--steps must be positive")
+    if args.batch_size < 1:
+        parser.error("--batch_size must be positive")
+    if args.lr <= 0:
+        parser.error("--lr must be positive")
+    if args.warmup_steps < 0:
+        parser.error("--warmup_steps must be >= 0")
+    if args.num_workers < 0:
+        parser.error("--num_workers must be >= 0")
     if args.dataset_config_path is None or not args.dataset_config_path.is_file():
         parser.error("--dataset_config_path must name an existing file")
     if args.config and not args.config.is_file():
@@ -196,12 +239,19 @@ def main():
     dataset = LiteGaussDataset.from_config(dataset_config, action_horizon=horizon)
     if not len(dataset):
         raise ValueError("LIBERO dataset is empty")
+    if len(dataset) < args.batch_size:
+        raise ValueError(
+            f"dataset length {len(dataset)} < batch_size {args.batch_size}; lower --batch_size"
+        )
     norm_stats = _norm_stats_from_dataset(dataset)
     policy = LiteGaussPolicy({**config, "device": "cuda", "state_dim": 24, "per_action_dim": 24,
                               "action_horizon": horizon,
                               "num_categories": len(dataset_config["data_groups"])}).train()
-    optimizer = torch.optim.AdamW((p for p in policy.parameters() if p.requires_grad), lr=1e-4)
-    lr = 1e-4
+    lr = args.lr
+    warmup_steps = args.warmup_steps
+    optimizer = torch.optim.AdamW((p for p in policy.parameters() if p.requires_grad), lr=lr)
+    scheduler = LambdaLR(optimizer, get_lr_lambda(warmup_steps, args.steps))
+    batch_size = args.batch_size
     run_name = args.swanlab_run or f"litegauss-steps{args.steps}"
     use_swanlab = (
         not args.no_swanlab
@@ -215,28 +265,65 @@ def main():
             config={
                 "steps": args.steps,
                 "lr": lr,
-                "batch_size": 1,
+                "warmup_steps": warmup_steps,
+                "lr_schedule": "warmup_cosine",
+                "batch_size": batch_size,
+                "samples_per_step": batch_size,
                 "action_horizon": horizon,
                 "dataset_config_path": str(args.dataset_config_path),
                 "output": str(args.output) if args.output else None,
+                "dataset_len": len(dataset),
                 **{k: config[k] for k in config},
             },
         )
-    for step in range(args.steps):
-        batch = dataset[step % len(dataset)]
-        optimizer.zero_grad(set_to_none=True)
-        loss = policy.train_step(**batch)
-        if not torch.isfinite(loss):
-            raise RuntimeError("non-finite loss")
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_((p for p in policy.parameters() if p.requires_grad),
-                                      1.0, error_if_nonfinite=True)
-        optimizer.step()
-        step_i = step + 1
-        loss_v = loss.item()
-        print(f"step={step_i} loss={loss_v:.6f}")
-        if use_swanlab:
-            swanlab.log({"step": step_i, "loss": loss_v, "learning_rate": lr})
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        collate_fn=_collate_list,
+        drop_last=True,
+        persistent_workers=args.num_workers > 0,
+    )
+    print(
+        f"train: steps={args.steps} batch_size={batch_size} lr={lr} "
+        f"warmup_steps={warmup_steps} schedule=warmup_cosine "
+        f"dataset_len={len(dataset)} (~{args.steps * batch_size / len(dataset):.4f} epoch)"
+    )
+    step = 0
+    while step < args.steps:
+        for items in loader:
+            if step >= args.steps:
+                break
+            optimizer.zero_grad(set_to_none=True)
+            # Evo-style: encode/loss per sample, mean over the batch, one optimizer step.
+            losses = []
+            for item in items:
+                loss_i = policy.train_step(**item)
+                if not torch.isfinite(loss_i):
+                    raise RuntimeError("non-finite loss")
+                losses.append(loss_i)
+            loss = torch.stack(losses).mean()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(
+                (p for p in policy.parameters() if p.requires_grad),
+                1.0,
+                error_if_nonfinite=True,
+            )
+            optimizer.step()
+            scheduler.step()
+            step += 1
+            loss_v = loss.item()
+            lr_now = scheduler.get_last_lr()[0]
+            print(f"step={step} loss={loss_v:.6f} lr={lr_now:.6e} batch_size={batch_size}")
+            if use_swanlab:
+                swanlab.log({
+                    "step": step,
+                    "loss": loss_v,
+                    "learning_rate": lr_now,
+                    "batch_size": batch_size,
+                    "samples_seen": step * batch_size,
+                })
     if args.output:
         out = save_checkpoint_dir(
             args.output,
@@ -246,7 +333,12 @@ def main():
             lr=lr,
             dataset_config_path=args.dataset_config_path,
             camera_order=dataset.camera_order,
-            policy_config=policy.config,
+            policy_config={
+                **policy.config,
+                "batch_size": batch_size,
+                "warmup_steps": warmup_steps,
+                "lr_schedule": "warmup_cosine",
+            },
             gst_state=policy.litegauss.gst.state_dict(),
             action_head_state=policy.litegauss.action_head.state_dict(),
             optimizer_state=optimizer.state_dict(),
