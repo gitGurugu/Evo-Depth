@@ -8,12 +8,57 @@ bash scripts/run_litegauss_train.sh ...
 
 详细实现：`Evo_depth/scripts/train_litegauss_libero.py`。
 
+## 先缓存 DA3，再训练（默认必须命中）
+
+在服务器仓库根目录运行；`config.libero.yaml` 中的四个数据路径须先指向本机 LIBERO/LeRobot 数据。
+两个入口都保留 `HF_ENDPOINT=https://hf-mirror.com` 和清除失效代理的处理。
+
+```bash
+cd ~/Evo-Depth
+source .venv/bin/activate
+export DATASET_CONFIG="$PWD/Evo_depth/dataset/config.libero.yaml"
+export LITEGAUSS_DEPTH_CACHE="$PWD/data/litegauss_da3_depth_cache"
+
+# 只需构建一次；中断后原命令重跑会跳过已有有效键。
+bash scripts/run_litegauss_depth_cache.sh --action-horizon 16
+
+# 默认 cache-required：缺失立即报错，也不加载 DA3 权重。
+bash scripts/run_litegauss_train.sh --name cached-bs16-5k --steps 5000 --batch-size 16
+
+# 可选：命中读缓存，未命中才逐图在线 DA3（不自动回写缓存）。
+bash scripts/run_litegauss_train.sh --name mixed-smoke --steps 100 --allow-online-da3
+```
+
+缓存构建器复用 `LiteGaussDataset`、相同 `view_map`、视频解码与无增强 Resize→RGB 转换，
+每个 DA3 调用严格为 `inference_images([rgb])`；agent/wrist 也分别推理。
+默认 action horizon=16；自定义训练 horizon 时构建器传相同 `--action-horizon`。
+
+键布局为 `<cache-root>/da3-base-mono-rgb448-v1/<agent|wrist>/<sha256前2位>/<sha256>.npz`。
+哈希输入是实际训练 RGB 的 448×448 像素字节；LeRobot 当前不返回 episode/frame，且解码失败会随机换样本，
+因此不以请求索引推断身份。相同相机相同像素跨 episode/数据集/action window 自动去重；像素变化生成新键。
+每个文件只存 `depth`：DA3 原输出分辨率的有限 float32 H×W，无额外尺度归一化。
+训练按每张 RGB 的 K 缩放到该深度分辨率，再走原 GST patch 对齐；B>1 按 `[B][V]` 传深度并保持真 batch。
+
+重跑仍会解码 RGB 计算键，但有效文件跳过 DA3；全部命中时构建器不会加载 DA3 权重。
+进度输出样本数、新写入数、跳过数和 ETA。写入采用同目录临时文件 + 原子替换；损坏文件明确报错，
+确认后删除该文件再重跑。构建沿用训练 loader 的坏视频随机换样本行为，偶发未覆盖帧会在严格训练时暴露。
+缓存版本固定对应当前 `depth-anything/da3-base` 单图默认推理；更换权重/DA3 预处理实现后使用新的空缓存目录重建。
+约 55 万 RGB 的 float32 原始深度可能占数百 GB，NPZ 压缩后以实际磁盘占用为准；未提供分片或自动清理。
+推理/server 仍默认在线 DA3。
+
+独立 CPU 自检，不需要数据或 DA3 权重：
+
+```bash
+bash scripts/run_litegauss_train.sh --selfcheck
+bash scripts/run_litegauss_depth_cache.sh --selfcheck
+```
+
 ## 训练语义（按 step，不是按 epoch）
 
 - **`--steps`**：optimizer 更新次数（停机条件）。
 - **`--batch-size B`**：**真 batch**——一步 forward/backward 同时处理 **B 条样本**（张量带 batch 维），然后 **更新一次**权重。
 - 单条样本格式固定（多相机、448×448 等），与 B 无关；B 只决定一次叠几条。
-- DA3 仍按图独立推理（避免多无关图被当成同一场景多视角）；InternVL / GST / action head 走真 B。
+- DA3 在预处理时按图独立推理；训练默认全部读缓存，显式允许时缺失才单图在线推理；InternVL / GST / action head 走真 B。
 - 日志里的 `~x.xx epoch` 只是「这些步大约扫了多少遍数据」的换算，**不是**按 epoch 停训。
 
 学习率：线性 warmup（默认 1000 step）+ cosine 降到 0（与 Evo `train.py` 同公式）；峰值 lr 默认 `1e-4`。
@@ -111,6 +156,8 @@ bash scripts/run_litegauss_train.sh \
 | `--swanlab-project` / `SWANLAB_PROJECT` | SwanLab 项目 | `litegauss` |
 | `--no-swanlab` / `SWANLAB_MODE=disabled` | 关闭上传 | 默认 cloud |
 | `--dataset_config_path` | 数据配置 | `Evo_depth/dataset/config.libero.yaml` |
+| `--depth-cache-root` / `LITEGAUSS_DEPTH_CACHE` | 深度缓存目录（构建和训练相同） | 仓库根目录 `data/litegauss_da3_depth_cache` |
+| `--allow-online-da3` | 训练缺失缓存时允许单图在线 DA3 | 关：缺失报错 |
 
 ## 旧版单文件 `.pt` 转目录
 

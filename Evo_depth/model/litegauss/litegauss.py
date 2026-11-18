@@ -20,20 +20,25 @@ class LiteGauss(nn.Module):
     not implemented inside LiteGauss. Without it, returns concatenated GST outputs.
     """
 
-    def __init__(self, embedder, depth, gst, action_head=None, max_text_len: int = 128):
+    def __init__(self, embedder, depth, gst, action_head=None, max_text_len: int = 128,
+                 allow_online_da3=True):
         super().__init__()
         self.embedder = embedder
         self.depth = depth
         self.gst = gst
         self.action_head = action_head
         self.max_text_len = max_text_len
+        self.allow_online_da3 = allow_online_da3
 
-    def encode_gst(self, rgb, K) -> dict:
-        return self.encode_gst_images([rgb], [K])
+    def encode_gst(self, rgb, K, depth=None) -> dict:
+        return self.encode_gst_images([rgb], [K], [depth])
 
-    def encode_gst_images(self, images, intrinsics) -> dict:
-        """One ViT/GST call over images; DA3 always sees exactly one image."""
+    def encode_gst_images(self, images, intrinsics, depths=None) -> dict:
+        """One ViT/GST call; use supplied HxW depths, or mono DA3 on allowed misses."""
         images = [image.convert("RGB") for image in images]
+        depths = [None] * len(images) if depths is None else depths
+        if len(depths) != len(images):
+            raise ValueError("Each RGB must have a depth map or an explicit online miss (None)")
         ref = self.gst.queries
         matrices = [torch.as_tensor(k, device=ref.device, dtype=ref.dtype) for k in intrinsics]
         if len(matrices) != len(images) or any(
@@ -48,10 +53,15 @@ class LiteGauss(nn.Module):
             raise ValueError("Expected one square InternVL patch grid per image")
 
         aligned_images = []
-        for rgb, K in zip(images, matrices):
-            # DA3's image list is a scene/view axis, never an independent-sample batch.
-            prediction = self.depth.inference_images([rgb])
-            depth = torch.as_tensor(prediction.depth, device=feat.device, dtype=feat.dtype)
+        for rgb, K, depth in zip(images, matrices, depths):
+            if depth is None:
+                if not self.allow_online_da3:
+                    raise FileNotFoundError("Cached depth required; build cache first or use --allow-online-da3")
+                # DA3's image list is a scene/view axis, never an independent-sample batch.
+                depth = self.depth.inference_images([rgb]).depth
+            depth = torch.as_tensor(depth, device=feat.device, dtype=feat.dtype)
+            if depth.ndim == 2:
+                depth = depth.unsqueeze(0)
             if depth.ndim != 3 or depth.shape[0] != 1 or not torch.isfinite(depth).all():
                 raise ValueError("Expected one finite DA3 depth map (1,H,W)")
             K_depth = scale_intrinsics(K, (rgb.height, rgb.width), depth.shape[-2:])
@@ -93,7 +103,7 @@ class LiteGauss(nn.Module):
     def batch_size(rgb):
         return len(rgb) if isinstance(rgb, (list, tuple)) and rgb and isinstance(rgb[0], (list, tuple)) else 1
 
-    def encode_context(self, rgb, K, prompt=""):
+    def encode_context(self, rgb, K, prompt="", depths=None):
         nested = isinstance(rgb, (list, tuple)) and rgb and isinstance(rgb[0], (list, tuple))
         if nested:
             B, V = len(rgb), len(rgb[0])
@@ -102,9 +112,12 @@ class LiteGauss(nn.Module):
                     or not isinstance(prompt, (list, tuple)) or len(prompt) != B
                     or any(not isinstance(text, str) for text in prompt)):
                 raise ValueError("Expected RGB [B][V], K [B,V,3,3], and B text prompts")
+            if depths is not None and (len(depths) != B or any(len(row) != V for row in depths)):
+                raise ValueError("Expected depths [B][V] matching RGB")
             if B > 1:
+                flat_depths = None if depths is None else [depth for row in depths for depth in row]
                 out = self.encode_gst_images([im for row in rgb for im in row],
-                                             [k for row in K for k in row])
+                                             [k for row in K for k in row], flat_depths)
                 gst_out = {key: value.reshape(B, V * value.shape[1], *value.shape[2:])
                            for key, value in out.items()}
                 lang, lang_mask = self.encode_text(list(prompt), return_mask=True)
@@ -114,13 +127,17 @@ class LiteGauss(nn.Module):
                 return gst_out, lang, self.build_context(tokens, lang), context_mask
             # Preserve the production B=1 path, including its per-camera forwards.
             rgb, K, prompt = rgb[0], list(K[0]), prompt[0]
+            depths = None if depths is None else depths[0]
         if isinstance(rgb, (list, tuple)):
             if not rgb or not isinstance(K, (list, tuple)) or len(rgb) != len(K):
                 raise ValueError("RGB and K sequences must have the same nonzero length")
-            views = [self.encode_gst(image, k) for image, k in zip(rgb, K)]
+            depths = [None] * len(rgb) if depths is None else depths
+            if len(depths) != len(rgb):
+                raise ValueError("Expected one depth map per RGB view")
+            views = [self.encode_gst(image, k, depth) for image, k, depth in zip(rgb, K, depths)]
             gst_out = {key: torch.cat([view[key] for view in views], dim=1) for key in views[0]}
         else:
-            gst_out = self.encode_gst(rgb, K)
+            gst_out = self.encode_gst(rgb, K, depths)
         lang = self.encode_text(prompt)
         return gst_out, lang, self.build_context(gst_out["tokens"], lang), None
 
@@ -133,8 +150,9 @@ class LiteGauss(nn.Module):
         actions_gt: torch.Tensor | None = None,
         action_mask: torch.Tensor | None = None,
         embodiment_id: torch.Tensor | None = None,
+        depths=None,
     ):
-        gst_out, lang, context, context_mask = self.encode_context(rgb, K, prompt)
+        gst_out, lang, context, context_mask = self.encode_context(rgb, K, prompt, depths)
         if self.action_head is None:
             return {**gst_out, "lang": lang, "context": context,
                     **({"context_mask": context_mask} if context_mask is not None else {})}

@@ -15,6 +15,7 @@ from PIL import Image
 from torch.utils.data import Dataset
 
 from model.litegauss.libero_intrinsics import default_libero_Ks
+from dataset.litegauss_depth_cache import load_cached_depth
 
 
 def collate_litegauss(items):
@@ -26,13 +27,21 @@ def collate_litegauss(items):
     if not views or any(len(item["rgb"]) != views or len(item["K"]) != views
                         or [image.size for image in item["rgb"]] != sizes for item in items):
         raise ValueError("Batch samples must have the same cameras and image sizes")
-    return dict(
+    has_depths = "depths" in items[0]
+    if any(("depths" in item) != has_depths for item in items):
+        raise ValueError("Batch samples must consistently include depths")
+    if has_depths and any(len(item["depths"]) != views for item in items):
+        raise ValueError("Expected one cached depth or None per camera")
+    batch = dict(
         rgb=[item["rgb"] for item in items],
         K=torch.stack([torch.stack([torch.as_tensor(k) for k in item["K"]]) for item in items]),
         prompt=[item["prompt"] for item in items],
         **{key: torch.cat([item[key] for item in items], dim=0)
            for key in ("state", "actions_gt", "action_mask", "embodiment_id")},
     )
+    if has_depths:
+        batch["depths"] = [item["depths"] for item in items]
+    return batch
 
 
 def _camera_order(config):
@@ -58,14 +67,16 @@ def _camera_order(config):
 class LiteGaussDataset(Dataset):
     """Wrap an existing LeRobotDataset; each item can go to policy.train_step(**item)."""
 
-    def __init__(self, base_dataset):
+    def __init__(self, base_dataset, depth_cache_root=None, allow_online_da3=False):
         self.camera_order = _camera_order(base_dataset.config)
         self.base = base_dataset
+        self.depth_cache_root = depth_cache_root
+        self.allow_online_da3 = allow_online_da3
         # Fixed K is valid only for the base loader's plain Resize, without crops.
         self.base.use_augmentation = False
 
     @classmethod
-    def from_config(cls, config, action_horizon=16):
+    def from_config(cls, config, action_horizon=16, depth_cache_root=None, allow_online_da3=False):
         _camera_order(config)
         if action_horizon < 1:
             raise ValueError("action_horizon must be positive")
@@ -73,7 +84,7 @@ class LiteGaussDataset(Dataset):
         from dataset.lerobot_dataset_pretrain_mp import LeRobotDataset
 
         return cls(LeRobotDataset(config, image_size=448, action_horizon=action_horizon,
-                                 use_augmentation=False))
+                                 use_augmentation=False), depth_cache_root, allow_online_da3)
 
     def __len__(self):
         return len(self.base)
@@ -108,10 +119,15 @@ class LiteGaussDataset(Dataset):
                 or not state_mask.any() or not action_mask.any()
                 or not torch.isfinite(state).all() or not torch.isfinite(actions).all()):
             raise ValueError("State/actions must be finite with nonempty bool masks")
-        return dict(rgb=rgb, K=default_libero_Ks(images.shape[-2:], self.camera_order),
+        result = dict(rgb=rgb, K=default_libero_Ks(images.shape[-2:], self.camera_order),
                     prompt=sample["prompt"], state=state.masked_fill(~state_mask, 0).unsqueeze(0),
                     actions_gt=actions.unsqueeze(0), action_mask=action_mask.unsqueeze(0),
                     embodiment_id=sample["embodiment_id"].reshape(1))
+        if self.depth_cache_root is not None:
+            result["depths"] = [load_cached_depth(self.depth_cache_root, image, camera,
+                                                  allow_online_da3=self.allow_online_da3)
+                                for image, camera in zip(rgb, self.camera_order)]
+        return result
 
 
 def selfcheck():
