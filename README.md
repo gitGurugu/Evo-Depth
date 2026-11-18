@@ -412,3 +412,13 @@ bash scripts/run_litegauss_train.sh \
 ```
 
 Checkpoints land in `checkpoints/litegauss/<name>/{config.json,norm_stats.json,model.pt}`. SwanLab project defaults to `litegauss` unless you pass `--swanlab-project`.
+
+For LIBERO eval, do **not** point `Evo_depth_server.py` at a LiteGauss dir (it expects DeepSpeed `mp_rank_00_model_states.pt`). Use the LiteGauss websocket adapter instead:
+
+```bash
+bash scripts/run_litegauss_libero.sh libero_spatial
+# or: LITEGAUSS_CKPT=checkpoints/litegauss/<name> bash scripts/run_litegauss_libero.sh
+```
+
+Details: `[scripts/litegauss_train.md](scripts/litegauss_train.md)` (LIBERO 评测 section).
+

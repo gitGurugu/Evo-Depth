@@ -168,3 +168,22 @@ python Evo_depth/scripts/train_litegauss_libero.py \
   --dataset_config_path Evo_depth/dataset/config.libero.yaml \
   --output checkpoints/litegauss/run1
 ```
+## LIBERO 评测（LiteGauss server）
+
+不能把目录丢给 `Evo_depth_server.py`（它要 `mp_rank_00_model_states.pt`）。用专用 server，协议与 Evo 相同，客户端不用改：
+
+```bash
+# 只起服务（另开终端再跑 client 也可以）
+LITEGAUSS_CKPT_DIR=checkpoints/litegauss/run-bs224-400 \
+EVO_DEPTH_SERVER_PORT=9000 \
+PYTHONPATH=Evo_depth \
+  .venv/bin/python -u Evo_depth/scripts/litegauss_server.py
+
+# 或：起 server + LIBERO client
+bash scripts/run_litegauss_libero.sh libero_spatial
+LITEGAUSS_CKPT=checkpoints/litegauss/run-bs224-400 \
+  bash scripts/run_litegauss_libero.sh libero_goal
+```
+
+日志：`LIBERO-evaluation/logs/litegauss_<suite>/`。端口占用时先停掉旧 Evo/LiteGauss server（只杀对应 pid 文件里的进程）。
+
