@@ -3,21 +3,72 @@
 #
 #   bash scripts/run_litegauss_libero.sh
 #   bash scripts/run_litegauss_libero.sh libero_spatial
-#   LITEGAUSS_CKPT=checkpoints/litegauss/run-bs224-400 bash scripts/run_litegauss_libero.sh
+#   bash scripts/run_litegauss_libero.sh libero_spatial --name overfit-spatial
+#   LITEGAUSS_CKPT=checkpoints/litegauss/overfit-spatial \
+#     bash scripts/run_litegauss_libero.sh libero_spatial --name overfit-spatial
+#   bash scripts/run_litegauss_libero.sh libero_spatial --log-dir /tmp/my_eval
 #
+# --name TAG  → logs/litegauss_<suite>_<tag>/（与训练 --name 对齐，避免互相覆盖）
+# --log-dir D → 直接指定 client/server 日志根目录（优先于 --name）
 # Does not touch Evo_depth_server.py. Kill only the pid recorded in the log dir.
 
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SUITE="${1:-libero_spatial}"
+shift $(( $# > 0 ? 1 : 0 )) || true
+
 PORT="${EVO_DEPTH_SERVER_PORT:-9000}"
 CKPT="${LITEGAUSS_CKPT:-${LITEGAUSS_CKPT_DIR:-$ROOT/checkpoints/litegauss/run-bs224-400}}"
-LOG_DIR="$ROOT/LIBERO-evaluation/logs/litegauss_${SUITE}"
-SERVER_LOG="$LOG_DIR/server.log"
-PID_FILE="$LOG_DIR/server.pid"
+RUN_NAME=""
+LOG_DIR="${LITEGAUSS_LOG_DIR:-}"
 SERVER_PY="$ROOT/.venv/bin/python"
 CLIENT_PY="$ROOT/LIBERO-evaluation/.venv-libero/bin/python"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --name|--run-name)
+      RUN_NAME="$2"
+      shift 2
+      ;;
+    --log-dir)
+      LOG_DIR="$2"
+      shift 2
+      ;;
+    --ckpt)
+      CKPT="$2"
+      shift 2
+      ;;
+    -h|--help)
+      sed -n '2,14p' "$0"
+      exit 0
+      ;;
+    *)
+      echo "unknown arg: $1" >&2
+      exit 1
+      ;;
+  esac
+done
+
+# Safe slug for log subdirectory names.
+sanitize_name() {
+  local raw="$1"
+  raw="${raw//\//-}"
+  raw="$(printf '%s' "$raw" | tr -c 'A-Za-z0-9._-' '_')"
+  raw="$(printf '%s' "$raw" | sed -E 's/_+/_/g; s/^_|_$//g')"
+  [[ -n "$raw" ]] || raw="run"
+  printf '%s' "$raw"
+}
+
+if [[ -z "$LOG_DIR" ]]; then
+  if [[ -n "$RUN_NAME" ]]; then
+    LOG_DIR="$ROOT/LIBERO-evaluation/logs/litegauss_${SUITE}_$(sanitize_name "$RUN_NAME")"
+  else
+    LOG_DIR="$ROOT/LIBERO-evaluation/logs/litegauss_${SUITE}"
+  fi
+fi
+SERVER_LOG="$LOG_DIR/server.log"
+PID_FILE="$LOG_DIR/server.pid"
 
 log() { printf '\n==> %s\n' "$*"; }
 domestic() {
@@ -56,7 +107,7 @@ port_open() {
   "$SERVER_PY" -c 'import socket,sys; s=socket.socket(); r=s.connect_ex(("127.0.0.1", int(sys.argv[1]))); s.close(); raise SystemExit(0 if r==0 else 1)' "$1"
 }
 
-log "Start LiteGauss server ckpt=${CKPT}"
+log "Start LiteGauss server ckpt=${CKPT} log_dir=${LOG_DIR}"
 domestic \
   HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}" \
   HF_HUB_DISABLE_XET=1 \
