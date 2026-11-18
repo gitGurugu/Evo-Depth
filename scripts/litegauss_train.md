@@ -15,10 +15,8 @@ bash scripts/run_litegauss_train.sh ...
 
 ```bash
 cd ~/Evo-Depth
-source .venv/bin/activate
-export DATASET_CONFIG="$PWD/Evo_depth/dataset/config.libero.yaml"
-export LITEGAUSS_DEPTH_CACHE="$PWD/data/litegauss_da3_depth_cache"
 
+# 脚本内会 source .venv、设置 DATASET_CONFIG / LITEGAUSS_DEPTH_CACHE / HF 镜像。
 # 只需构建一次；中断后原命令重跑会跳过已有有效键。
 bash scripts/run_litegauss_depth_cache.sh --action-horizon 16
 
@@ -28,6 +26,8 @@ bash scripts/run_litegauss_train.sh --name cached-bs16-5k --steps 5000 --batch-s
 # 可选：命中读缓存，未命中才逐图在线 DA3（不自动回写缓存）。
 bash scripts/run_litegauss_train.sh --name mixed-smoke --steps 100 --allow-online-da3
 ```
+
+如需改路径，仍可在外部覆盖：`DATASET_CONFIG=... LITEGAUSS_DEPTH_CACHE=... bash scripts/run_litegauss_depth_cache.sh ...`
 
 缓存构建器复用 `LiteGaussDataset`、相同 `view_map`、视频解码与无增强 Resize→RGB 转换，
 每个 DA3 调用严格为 `inference_images([rgb])`；agent/wrist 也分别推理。
