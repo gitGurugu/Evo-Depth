@@ -3,10 +3,12 @@
 #
 #   bash scripts/run_litegauss_depth_cache.sh
 #   bash scripts/run_litegauss_depth_cache.sh --action-horizon 16
+#   bash scripts/run_litegauss_depth_cache.sh --num-workers 6
 #   bash scripts/run_litegauss_depth_cache.sh --selfcheck
 #
 # Activates repo .venv (if present), sets DATASET_CONFIG / LITEGAUSS_DEPTH_CACHE /
-# HF mirror defaults. Extra args go to cache_litegauss_depth.py.
+# HF mirror defaults. Extra args go to cache_litegauss_depth.py
+# (default --num-workers 4; override with flag or LITEGAUSS_DEPTH_CACHE_WORKERS).
 
 set -euo pipefail
 

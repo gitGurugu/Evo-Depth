@@ -1,6 +1,7 @@
 """Build mono DA3-base depth cache using the exact LiteGauss training RGB path."""
 
 import argparse
+import multiprocessing as mp
 import os
 import sys
 import time
@@ -12,12 +13,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from dataset.litegauss_depth_cache import DEFAULT_CACHE_ROOT, cache_depth, load_cached_depth
 from dataset.litegauss_loader import LiteGaussDataset
 
+# RTX 4090 single-GPU probe: N=4 ~3.6x, N=6 ~4.8x peak, N=8 flat/worse.
+DEFAULT_NUM_WORKERS = 4
 
-def build_cache(dataset, root, depth_factory, log_every=100):
+
+def build_cache(dataset, root, depth_factory, log_every=100, indices=None, worker_id=None):
+    indices = list(range(len(dataset)) if indices is None else indices)
     depth_provider = None
     written = skipped = 0
     started = time.monotonic()
-    for index in range(len(dataset)):
+    tag = f"cache[w{worker_id}]" if worker_id is not None else "cache"
+    total = len(indices)
+    for done, index in enumerate(indices, 1):
         sample = dataset[index]
         for rgb, camera in zip(sample["rgb"], dataset.camera_order):
             if load_cached_depth(root, rgb, camera, allow_online_da3=True) is not None:
@@ -26,11 +33,68 @@ def build_cache(dataset, root, depth_factory, log_every=100):
             if depth_provider is None:
                 depth_provider = depth_factory()
             written += int(cache_depth(root, rgb, camera, depth_provider))
-        if (index + 1) % log_every == 0 or index + 1 == len(dataset):
+        if done % log_every == 0 or done == total:
             elapsed = time.monotonic() - started
-            eta = elapsed / (index + 1) * (len(dataset) - index - 1)
-            print(f"cache: samples={index + 1}/{len(dataset)} written={written} skipped={skipped} "
+            eta = elapsed / done * (total - done) if done else 0.0
+            print(f"{tag}: samples={done}/{total} written={written} skipped={skipped} "
                   f"elapsed={elapsed:.0f}s ETA={eta:.0f}s", flush=True)
+    return written, skipped
+
+
+def _cache_worker(rank, world_size, dataset_config_path, depth_cache_root, action_horizon,
+                  device, log_every, result_queue):
+    """One process, one DA3-base; shard by sample index % world_size."""
+    import yaml
+    import torch
+
+    config = yaml.safe_load(Path(dataset_config_path).read_text(encoding="utf-8"))
+    dataset = LiteGaussDataset.from_config(config, action_horizon=action_horizon)
+    n = len(dataset)
+    if not n:
+        raise ValueError("LIBERO dataset is empty")
+    indices = range(rank, n, world_size)
+    shard_n = (n - rank + world_size - 1) // world_size
+
+    def load_depth():
+        from model.depth_anything_3.depth_anything_v3 import DAV3Module
+        return DAV3Module().to(device).eval()
+
+    print(f"cache[w{rank}]: shard={rank}/{world_size} samples={shard_n}/{n} device={device}",
+          flush=True)
+    with torch.inference_mode():
+        written, skipped = build_cache(
+            dataset, Path(depth_cache_root), load_depth, log_every, indices, worker_id=rank)
+    result_queue.put((rank, written, skipped))
+
+
+def run_parallel(dataset_config_path, depth_cache_root, action_horizon, device, log_every,
+                 num_workers):
+    ctx = mp.get_context("spawn")
+    result_queue = ctx.Queue()
+    procs = []
+    for rank in range(num_workers):
+        proc = ctx.Process(
+            target=_cache_worker,
+            args=(rank, num_workers, str(dataset_config_path), str(depth_cache_root),
+                  action_horizon, device, log_every, result_queue),
+        )
+        procs.append(proc)
+        proc.start()
+    results = []
+    for proc in procs:
+        proc.join()
+        if proc.exitcode:
+            for other in procs:
+                if other.is_alive():
+                    other.terminate()
+            raise RuntimeError(f"depth-cache worker exited with code {proc.exitcode}")
+    while not result_queue.empty():
+        results.append(result_queue.get())
+    if len(results) != num_workers:
+        raise RuntimeError(f"expected {num_workers} worker results, got {len(results)}")
+    written = sum(row[1] for row in results)
+    skipped = sum(row[2] for row in results)
+    print(f"cache: workers={num_workers} written={written} skipped={skipped}", flush=True)
     return written, skipped
 
 
@@ -79,6 +143,13 @@ def selfcheck():
         def no_weights():
             raise AssertionError("Resume must not load DA3")
         assert build_cache(dataset, root, no_weights, log_every=2) == (0, 4)
+        # Shard coverage: odd/even indices together still write every view once.
+        root_shard = Path(directory) / "shard"
+        depths = [MockDepth(), MockDepth()]
+        assert build_cache(dataset, root_shard, lambda: depths[0], log_every=2, indices=[0],
+                           worker_id=0)[0] == 2
+        assert build_cache(dataset, root_shard, lambda: depths[1], log_every=2, indices=[1],
+                           worker_id=1) == (0, 2)
         rgb = sample["rgb"][0]
         path = depth_cache_path(root, rgb, "agent")
         assert path == depth_cache_path(root, rgb.copy(), "agent")
@@ -167,8 +238,8 @@ def selfcheck():
         else:
             raise AssertionError("Invalid cache depth accepted")
         assert "model.depth_anything_3.depth_anything_v3" not in sys.modules
-    print("PASS: cache keys/camera/pixels; float32; mono builder; dedupe/resume; loader -> B=2 GST/backward; "
-          "per-sample/view ordering; cached/online and B=1 parity; "
+    print("PASS: cache keys/camera/pixels; float32; mono builder; dedupe/resume; shard indices; "
+          "loader -> B=2 GST/backward; per-sample/view ordering; cached/online and B=1 parity; "
           "required miss/mixed fallback/corruption/atomic write; no DA3 weights")
 
 
@@ -181,28 +252,41 @@ def main():
     parser.add_argument("--action-horizon", type=int, default=16)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--log-every", type=int, default=100)
+    parser.add_argument(
+        "--num-workers", type=int,
+        default=int(os.environ.get("LITEGAUSS_DEPTH_CACHE_WORKERS", DEFAULT_NUM_WORKERS)),
+        help=f"concurrent DA3-base processes on one GPU (default {DEFAULT_NUM_WORKERS}; "
+             "4090 probe peaked near 6, 8 no gain)")
     parser.add_argument("--selfcheck", action="store_true")
     args = parser.parse_args()
     if args.selfcheck:
         selfcheck()
         return
-    if args.log_every < 1 or args.action_horizon < 1:
-        parser.error("--log-every and --action-horizon must be positive")
-    import yaml
-    import torch
+    if args.log_every < 1 or args.action_horizon < 1 or args.num_workers < 1:
+        parser.error("--log-every, --action-horizon, and --num-workers must be positive")
 
-    config = yaml.safe_load(args.dataset_config_path.read_text(encoding="utf-8"))
-    dataset = LiteGaussDataset.from_config(config, action_horizon=args.action_horizon)
-    if not len(dataset):
-        raise ValueError("LIBERO dataset is empty")
+    print(f"cache root={args.depth_cache_root} dataset={args.dataset_config_path} "
+          f"num_workers={args.num_workers}", flush=True)
+    if args.num_workers == 1:
+        import yaml
+        import torch
 
-    def load_depth():
-        from model.depth_anything_3.depth_anything_v3 import DAV3Module
-        return DAV3Module().to(args.device).eval()
+        config = yaml.safe_load(args.dataset_config_path.read_text(encoding="utf-8"))
+        dataset = LiteGaussDataset.from_config(config, action_horizon=args.action_horizon)
+        if not len(dataset):
+            raise ValueError("LIBERO dataset is empty")
 
-    print(f"cache root={args.depth_cache_root} dataset={args.dataset_config_path}", flush=True)
-    with torch.inference_mode():
-        build_cache(dataset, args.depth_cache_root, load_depth, args.log_every)
+        def load_depth():
+            from model.depth_anything_3.depth_anything_v3 import DAV3Module
+            return DAV3Module().to(args.device).eval()
+
+        with torch.inference_mode():
+            build_cache(dataset, args.depth_cache_root, load_depth, args.log_every)
+        return
+
+    run_parallel(
+        args.dataset_config_path, args.depth_cache_root, args.action_horizon,
+        args.device, args.log_every, args.num_workers)
 
 
 if __name__ == "__main__":
