@@ -147,6 +147,13 @@ bash scripts/run_litegauss_train.sh --selfcheck
 
 ## 常用训练
 
+单场景过拟合（顶层菜谱，参数写在脚本里；对齐 Evo `train.sh` 用法）：
+
+```bash
+bash scripts/train_litegauss_overfit_spatial.sh
+# -> 仅 libero_spatial；warmup=50；checkpoints/litegauss/overfit-spatial/
+```
+
 冒烟（默认 B=16）：
 
 ```bash
