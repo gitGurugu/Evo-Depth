@@ -137,7 +137,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--real", action="store_true", help="Load InternVL3-1B and DA3-base on CUDA")
     args = parser.parse_args()
-    path = ROOT.parent / "geom_probe.npz"
+    path = ROOT.parent / "geom_out" / "geom_probe.npz"
     if path.exists():
         with np.load(path) as data:
             rgb = Image.fromarray(data["images"][0, 0])

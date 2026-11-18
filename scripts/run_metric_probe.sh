@@ -4,7 +4,7 @@
 #
 #   bash scripts/run_metric_probe.sh
 #   bash scripts/run_metric_probe.sh libero_spatial camera 8
-#   SKIP_DUMP=1 bash scripts/run_metric_probe.sh   # reuse geom_probe.npz
+#   SKIP_DUMP=1 bash scripts/run_metric_probe.sh   # reuse geom_out/geom_probe.npz
 #
 # dump: LIBERO-PLUS-evaluation/.venv-libero-plus
 # eval: repo-root .venv
@@ -19,8 +19,8 @@ PORT_PY="$ROOT/.venv/bin/python"
 PLUS_PY="$ROOT/LIBERO-PLUS-evaluation/.venv-libero-plus/bin/python"
 PLUS="$ROOT/LIBERO-PLUS-evaluation/LIBERO-plus"
 JSON="$PLUS/libero/libero/benchmark/task_classification.json"
-NPZ="${NPZ:-$ROOT/geom_probe.npz}"
-OUT="${OUT:-$ROOT/geom_metric.json}"
+NPZ="${NPZ:-$ROOT/geom_out/geom_probe.npz}"
+OUT="${OUT:-$ROOT/geom_out/geom_metric.json}"
 PROBE="$ROOT/Evo_depth/scripts/probe_da3_metric.py"
 export LIBERO_CONFIG_PATH="${LIBERO_CONFIG_PATH:-$HOME/.libero-plus}"
 export MUJOCO_GL="${MUJOCO_GL:-osmesa}"
