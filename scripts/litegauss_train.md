@@ -141,9 +141,13 @@ PYTHONPATH=Evo_depth \
 
 # 或：起 server + LIBERO client
 bash scripts/run_litegauss_libero.sh libero_spatial
-LITEGAUSS_CKPT=checkpoints/litegauss/run-bs224-400 \
-  bash scripts/run_litegauss_libero.sh libero_goal
+# 与训练 --name 对齐，日志写到独立目录（不覆盖旧评测）：
+LITEGAUSS_CKPT=checkpoints/litegauss/overfit-spatial \
+  bash scripts/run_litegauss_libero.sh libero_spatial --name overfit-spatial
+# 或直接指定目录：
+#   bash scripts/run_litegauss_libero.sh libero_spatial --log-dir /tmp/my_eval
 ```
 
-日志：`LIBERO-evaluation/logs/litegauss_<suite>/`。端口占用时先停掉旧 Evo/LiteGauss server（只杀对应 pid 文件里的进程）。
+默认日志：`LIBERO-evaluation/logs/litegauss_<suite>/`；带 `--name TAG` 则为 `…/litegauss_<suite>_<tag>/`（也可用 `--log-dir` / `LITEGAUSS_LOG_DIR`）。
+端口占用时先停掉旧 Evo/LiteGauss server（只杀对应 pid 文件里的进程）。
 
