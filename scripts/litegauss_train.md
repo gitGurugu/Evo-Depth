@@ -8,105 +8,12 @@ bash scripts/run_litegauss_train.sh ...
 
 详细实现：`Evo_depth/scripts/train_litegauss_libero.py`。
 
-## 先缓存 DA3，再训练（默认必须命中）
-
-入口脚本：`scripts/run_litegauss_depth_cache.sh`（一条 pipeline：激活 `.venv`、设默认路径/HF 镜像、跑缓存）。
-底层：`Evo_depth/scripts/cache_litegauss_depth.py`。
-
-在服务器仓库根目录运行；`config.libero.yaml` 中的数据路径须先指向本机 LIBERO/LeRobot 数据。
-
-```bash
-cd ~/Evo-Depth
-
-# 常用：与训练 horizon 对齐；默认 4 个 DA3-base 同卡并行（可改 --num-workers）
-bash scripts/run_litegauss_depth_cache.sh --action-horizon 16
-
-# 4090 上吞吐峰值约在 6；再大（如 8）基本不涨
-bash scripts/run_litegauss_depth_cache.sh --action-horizon 16 --num-workers 6
-
-# 自检（不需数据 / DA3 权重）
-bash scripts/run_litegauss_depth_cache.sh --selfcheck
-```
-
-中断后用**同一命令**重跑即可跳过已有有效键。
-
-### `run_litegauss_depth_cache.sh` 参数（共 7 个，均可选）
-
-脚本本身不解析长选项名以外的特殊 flag；**全部转给** `cache_litegauss_depth.py`。共 **7** 个：
-
-| 参数 | 作用 | 默认 |
-|------|------|------|
-| `--dataset_config_path` | 数据 YAML | 脚本用环境变量 `DATASET_CONFIG`，默认 `Evo_depth/dataset/config.libero.yaml` |
-| `--depth-cache-root` | 缓存根目录 | 脚本用 `LITEGAUSS_DEPTH_CACHE`，默认 `data/litegauss_da3_depth_cache` |
-| `--action-horizon` | 与训练 `action_horizon` 一致 | `16` |
-| `--device` | DA3 设备 | `cuda` |
-| `--log-every` | 每 N 个 sample 打进度 | `100` |
-| `--num-workers` | 同卡并发 DA3-base 进程数（按 sample 下标分片） | `4`（可用 `LITEGAUSS_DEPTH_CACHE_WORKERS` 覆盖） |
-| `--selfcheck` | CPU 自检后退出，不建缓存 | 关 |
-
-环境变量（脚本入口会设默认，可在命令前覆盖）：
-
-| 变量 | 作用 | 默认 |
-|------|------|------|
-| `DATASET_CONFIG` | 传给 `--dataset_config_path` | `$ROOT/Evo_depth/dataset/config.libero.yaml` |
-| `LITEGAUSS_DEPTH_CACHE` | 传给 `--depth-cache-root` | `$ROOT/data/litegauss_da3_depth_cache` |
-| `LITEGAUSS_DEPTH_CACHE_WORKERS` | 传给 `--num-workers` | `4` |
-| `LITEGAUSS_PY` | Python 解释器 | `$ROOT/.venv/bin/python` |
-| `HF_ENDPOINT` | Hugging Face 镜像 | `https://hf-mirror.com` |
-
-多实例说明：每个 worker 加载完整 `da3-base`，仍严格 `inference_images([一张图])`；不能把无关图拼成 DA3 batch。
-RTX 4090（24GB）实测：权重约 0.51GB/实例，可塞 40+；吞吐约 N=4 ≈3.6×、N=6 ≈4.8× 见顶、N=8 无收益。默认 **4**（稳）；要更快可试 **6**。
-
-示例覆盖路径：
-
-```bash
-DATASET_CONFIG=/path/to/config.libero.yaml \
-LITEGAUSS_DEPTH_CACHE=/data/da3_cache \
-  bash scripts/run_litegauss_depth_cache.sh --action-horizon 16 --num-workers 4 --log-every 50
-```
-
-### 缓存后训练
-
-```bash
-# 默认 cache-required：缺失立即报错，也不加载 DA3 权重。
-bash scripts/run_litegauss_train.sh --name cached-bs16-5k --steps 5000 --batch-size 16
-
-# 可选：命中读缓存，未命中才逐图在线 DA3（不自动回写缓存）。
-bash scripts/run_litegauss_train.sh --name mixed-smoke --steps 100 --allow-online-da3
-```
-
-如需改路径，仍可在外部覆盖：`DATASET_CONFIG=... LITEGAUSS_DEPTH_CACHE=... bash scripts/run_litegauss_depth_cache.sh ...`
-
-缓存构建器复用 `LiteGaussDataset`、相同 `view_map`、视频解码与无增强 Resize→RGB 转换，
-每个 DA3 调用严格为 `inference_images([rgb])`；agent/wrist 也分别推理。
-默认 action horizon=16；自定义训练 horizon 时构建器传相同 `--action-horizon`。
-
-键布局为 `<cache-root>/da3-base-mono-rgb448-v1/<agent|wrist>/<sha256前2位>/<sha256>.npz`。
-哈希输入是实际训练 RGB 的 448×448 像素字节；LeRobot 当前不返回 episode/frame，且解码失败会随机换样本，
-因此不以请求索引推断身份。相同相机相同像素跨 episode/数据集/action window 自动去重；像素变化生成新键。
-每个文件只存 `depth`：DA3 原输出分辨率的有限 float32 H×W，无额外尺度归一化。
-训练按每张 RGB 的 K 缩放到该深度分辨率，再走原 GST patch 对齐；B>1 按 `[B][V]` 传深度并保持真 batch。
-
-重跑仍会解码 RGB 计算键，但有效文件跳过 DA3；全部命中时构建器不会加载 DA3 权重。
-进度输出样本数、新写入数、跳过数和 ETA。写入采用同目录临时文件 + 原子替换；损坏文件明确报错，
-确认后删除该文件再重跑。构建沿用训练 loader 的坏视频随机换样本行为，偶发未覆盖帧会在严格训练时暴露。
-缓存版本固定对应当前 `depth-anything/da3-base` 单图默认推理；更换权重/DA3 预处理实现后使用新的空缓存目录重建。
-约 55 万 RGB 的 float32 原始深度可能占数百 GB，NPZ 压缩后以实际磁盘占用为准；构建可用 `--num-workers` 同卡多实例分片，未提供自动清理。
-推理/server 仍默认在线 DA3。
-
-独立 CPU 自检，不需要数据或 DA3 权重：
-
-```bash
-bash scripts/run_litegauss_train.sh --selfcheck
-bash scripts/run_litegauss_depth_cache.sh --selfcheck
-```
-
 ## 训练语义（按 step，不是按 epoch）
 
 - **`--steps`**：optimizer 更新次数（停机条件）。
 - **`--batch-size B`**：**真 batch**——一步 forward/backward 同时处理 **B 条样本**（张量带 batch 维），然后 **更新一次**权重。
 - 单条样本格式固定（多相机、448×448 等），与 B 无关；B 只决定一次叠几条。
-- DA3 在预处理时按图独立推理；训练默认全部读缓存，显式允许时缺失才单图在线推理；InternVL / GST / action head 走真 B。
+- DA3 仍按图独立推理（避免多无关图被当成同一场景多视角）；InternVL / GST / action head 走真 B。
 - 日志里的 `~x.xx epoch` 只是「这些步大约扫了多少遍数据」的换算，**不是**按 epoch 停训。
 
 学习率：线性 warmup（默认 1000 step）+ cosine 降到 0（与 Evo `train.py` 同公式）；峰值 lr 默认 `1e-4`。
@@ -211,8 +118,6 @@ bash scripts/run_litegauss_train.sh \
 | `--swanlab-project` / `SWANLAB_PROJECT` | SwanLab 项目 | `litegauss` |
 | `--no-swanlab` / `SWANLAB_MODE=disabled` | 关闭上传 | 默认 cloud |
 | `--dataset_config_path` | 数据配置 | `Evo_depth/dataset/config.libero.yaml` |
-| `--depth-cache-root` / `LITEGAUSS_DEPTH_CACHE` | 深度缓存目录（构建和训练相同） | 仓库根目录 `data/litegauss_da3_depth_cache` |
-| `--allow-online-da3` | 训练缺失缓存时允许单图在线 DA3 | 关：缺失报错 |
 
 ## 旧版单文件 `.pt` 转目录
 

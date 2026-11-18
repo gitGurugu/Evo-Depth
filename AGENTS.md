@@ -15,7 +15,7 @@ NeurIPS 2027 **LiteGauss**：在 **Evo** 基线（InternVL + DA3 深度 + flow-m
 | 路径 | 作用 |
 |------|------|
 | `Evo_depth/model/litegauss/` | **可改** — GST + `LiteGauss` 策略 |
-| `Evo_depth/dataset/litegauss_*.py` | **可改** — LiteGauss 数据集 / 深度缓存 |
+| `Evo_depth/dataset/litegauss_*.py` | **可改** — LiteGauss 数据集 |
 | `Evo_depth/scripts/train_litegauss_*.py`、`litegauss_server.py` | **可改** — 训练 / 推理服务 |
 | `scripts/run_litegauss_*.sh`、`scripts/litegauss_train.md` | **可改** — 入口脚本 + 训练说明 |
 | `Evo_depth/`（其余）、各 eval 客户端、Evo `train.sh` | **参考** — 原版 Evo；默认不要改 |
@@ -32,8 +32,7 @@ NeurIPS 2027 **LiteGauss**：在 **Evo** 基线（InternVL + DA3 深度 + flow-m
 ## 关键代码路径
 
 - LiteGauss 策略：`Evo_depth/model/litegauss/`（`LiteGauss`、`GaussianSpatialTokenizer`）
-- 深度缓存 → 训练：`scripts/run_litegauss_depth_cache.sh` → `scripts/run_litegauss_train.sh`
-- 训练实现：`Evo_depth/scripts/train_litegauss_libero.py`
+- 训练入口：`scripts/run_litegauss_train.sh` → `Evo_depth/scripts/train_litegauss_libero.py`
 - Evo 基线（只读参考）：DA3 `…/depth_anything_3/depth_anything_v3.py` → `DAV3Module`；InternVL 在 `Evo_depth/model/internvl3/`
 
 ## 评测注意

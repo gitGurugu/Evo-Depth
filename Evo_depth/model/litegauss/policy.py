@@ -15,7 +15,7 @@ from .litegauss import LiteGauss
 
 
 class LiteGaussPolicy(nn.Module):
-    def __init__(self, config=None, *, embedder=None, depth=None, allow_online_da3=True):
+    def __init__(self, config=None, *, embedder=None, depth=None):
         super().__init__()
         self.config = dict(config or {})
         cfg = self.config
@@ -28,8 +28,6 @@ class LiteGaussPolicy(nn.Module):
                 model_name=cfg.get("vlm_name", "OpenGVLab/InternVL3-1B"),
                 image_size=cfg.get("image_size", 448), device=device, use_da3=False,
             )
-        if depth is None and not allow_online_da3:
-            depth = nn.Identity()  # Cache-required training needs no DA3 weights in VRAM.
         if depth is None:
             from model.depth_anything_3.depth_anything_v3 import DAV3Module
 
@@ -70,7 +68,6 @@ class LiteGaussPolicy(nn.Module):
         self.litegauss = LiteGauss(
             embedder.to(device), depth.to(device), gst, action_head=head,
             max_text_len=cfg.get("max_text_len", 128),
-            allow_online_da3=allow_online_da3,
         )
         self.freeze_backbones()
 
@@ -110,10 +107,10 @@ class LiteGaussPolicy(nn.Module):
         return ids
 
     def forward(self, rgb, K, prompt="", state=None, actions_gt=None,
-                action_mask=None, embodiment_id=None, depths=None):
+                action_mask=None, embodiment_id=None):
         """Return scalar mean sample loss, or predicted (B,horizon,action_dim)."""
         if actions_gt is None:
-            return self.predict(rgb, K, prompt, state, action_mask, embodiment_id, depths)
+            return self.predict(rgb, K, prompt, state, action_mask, embodiment_id)
         actions = self._tensor(actions_gt)
         if actions.ndim == 2:
             actions = actions.unsqueeze(0)
@@ -135,7 +132,6 @@ class LiteGaussPolicy(nn.Module):
         velocity, noise = self.litegauss(
             rgb, K, prompt, state=self._state(state, B), actions_gt=head_actions,
             action_mask=head_mask, embodiment_id=ids,
-            depths=depths,
         )
         target = actions.flatten(1) - noise.flatten(1)
         return (((velocity - target).square() * mask.flatten(1)).sum(1)
@@ -146,7 +142,7 @@ class LiteGaussPolicy(nn.Module):
         return self(rgb, K, prompt, state, actions_gt, **kwargs)
 
     @torch.no_grad()
-    def predict(self, rgb, K, prompt="", state=None, action_mask=None, embodiment_id=None, depths=None):
+    def predict(self, rgb, K, prompt="", state=None, action_mask=None, embodiment_id=None):
         """Inference mask is (B,per_action_dim), shared across the action horizon."""
         B = self.litegauss.batch_size(rgb)
         mask = self._tensor(torch.ones(B, self.per_action_dim) if action_mask is None else action_mask)
@@ -159,7 +155,7 @@ class LiteGaussPolicy(nn.Module):
         self.eval()
         try:
             core = self.litegauss
-            _, _, context, context_mask = core.encode_context(rgb, K, prompt, depths)
+            _, _, context, context_mask = core.encode_context(rgb, K, prompt)
             ids = self._ids(embodiment_id, B)
             actions = core.action_head.get_action(
                 context, state=self._state(state, B), action_mask=mask, embodiment_id=ids,

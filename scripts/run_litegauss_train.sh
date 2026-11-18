@@ -7,8 +7,6 @@
 #   bash scripts/run_litegauss_train.sh --name auto --batch-size 64 --probe-max-batch
 # --probe-max-batch: find largest true B <= --batch-size fitting CUDA VRAM before training.
 #   DATASET_CONFIG=/path/to/config.libero.yaml bash scripts/run_litegauss_train.sh --name x --steps 100
-# Build cache first: bash scripts/run_litegauss_depth_cache.sh
-# --depth-cache-root DIR (or LITEGAUSS_DEPTH_CACHE); --allow-online-da3 permits misses.
 #
 # Checkpoint dir: checkpoints/litegauss/<name>/{config.json,norm_stats.json,model.pt}
 # Needs: setup_train_server.sh (.venv), setup_dataset.sh (config + data) for real runs.
@@ -30,8 +28,6 @@ SWANLAB_PROJECT="${SWANLAB_PROJECT:-litegauss}"
 SELFCHECK=0
 NO_SWANLAB=0
 PROBE_MAX_BATCH=0
-DEPTH_CACHE_ROOT="${LITEGAUSS_DEPTH_CACHE:-$ROOT/data/litegauss_da3_depth_cache}"
-ALLOW_ONLINE_DA3=0
 export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
 export HF_HUB_DISABLE_XET=1
 export SWANLAB_MODE="${SWANLAB_MODE:-cloud}"
@@ -62,8 +58,6 @@ while [[ $# -gt 0 ]]; do
     --steps) STEPS="$2"; shift 2 ;;
     --batch-size|--batch_size) BATCH_SIZE="$2"; shift 2 ;;
     --probe-max-batch) PROBE_MAX_BATCH=1; shift ;;
-    --depth-cache-root) DEPTH_CACHE_ROOT="$2"; shift 2 ;;
-    --allow-online-da3) ALLOW_ONLINE_DA3=1; shift ;;
     --lr) LR="$2"; shift 2 ;;
     --warmup-steps|--warmup_steps) WARMUP_STEPS="$2"; shift 2 ;;
     --output) OUTPUT="$2"; shift 2 ;;
@@ -119,7 +113,6 @@ cmd=(
   SWANLAB_MODE="$SWANLAB_MODE"
   "$PY" Evo_depth/scripts/train_litegauss_libero.py
   --dataset_config_path "$DATASET_CONFIG"
-  --depth-cache-root "$DEPTH_CACHE_ROOT"
   --steps "$STEPS"
   --batch-size "$BATCH_SIZE"
   --lr "$LR"
@@ -131,7 +124,6 @@ cmd=(
 [[ -n "$CONFIG_JSON" ]] && cmd+=(--config "$CONFIG_JSON")
 [[ "$NO_SWANLAB" -eq 1 ]] && cmd+=(--no-swanlab)
 [[ "$PROBE_MAX_BATCH" -eq 1 ]] && cmd+=(--probe-max-batch)
-[[ "$ALLOW_ONLINE_DA3" -eq 1 ]] && cmd+=(--allow-online-da3)
 
 mkdir -p "$(dirname "$OUTPUT")"
 

@@ -3,8 +3,7 @@
 Each update uses one true sample batch: one policy forward/backward/optimizer step.
 --batch-size (alias --batch_size) defaults to 16. --probe-max-batch searches for the
 largest true batch up to that limit with full-length text and forward/backward/
-AdamW workspace, lowering B on CUDA OOM. Training requires cached DA3 depths;
---allow-online-da3 permits independent single-image inference on cache misses.
+AdamW workspace, lowering B on CUDA OOM. DA3 remains image-independent.
 
 Real example (paths must exist):
   python Evo_depth/scripts/train_litegauss_libero.py --dataset_config_path DATA.yaml --steps 2
@@ -32,7 +31,6 @@ from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
 
 from dataset.litegauss_loader import LiteGaussDataset, collate_litegauss, selfcheck
-from dataset.litegauss_depth_cache import DEFAULT_CACHE_ROOT
 
 
 def probe_max_batch(policy, dataset, max_batch):
@@ -249,10 +247,6 @@ def main():
         type=Path,
         help="One-shot: convert a legacy single .pt into an Evo-style checkpoint directory",
     )
-    parser.add_argument("--depth-cache-root", type=Path,
-                        default=Path(os.environ.get("LITEGAUSS_DEPTH_CACHE", DEFAULT_CACHE_ROOT)))
-    parser.add_argument("--allow-online-da3", action="store_true",
-                        help="Run mono DA3 on cache misses; default requires every depth in cache")
     args = parser.parse_args()
     if args.selfcheck:
         if (args.dataset_config_path or args.config or args.output or args.steps != 1
@@ -349,9 +343,7 @@ def main():
     dataset_config = yaml.safe_load(args.dataset_config_path.read_text(encoding="utf-8"))
     config = json.loads(args.config.read_text(encoding="utf-8")) if args.config else {}
     horizon = config.get("action_horizon", config.get("horizon", 16))
-    dataset = LiteGaussDataset.from_config(dataset_config, action_horizon=horizon,
-                                          depth_cache_root=args.depth_cache_root,
-                                          allow_online_da3=args.allow_online_da3)
+    dataset = LiteGaussDataset.from_config(dataset_config, action_horizon=horizon)
     if not len(dataset):
         raise ValueError("LIBERO dataset is empty")
     if len(dataset) < args.batch_size and not args.probe_max_batch:
@@ -361,10 +353,7 @@ def main():
     norm_stats = _norm_stats_from_dataset(dataset)
     policy = LiteGaussPolicy({**config, "device": "cuda", "state_dim": 24, "per_action_dim": 24,
                               "action_horizon": horizon,
-                              "depth_cache_root": str(args.depth_cache_root),
-                              "allow_online_da3": args.allow_online_da3,
-                              "num_categories": len(dataset_config["data_groups"])},
-                             allow_online_da3=args.allow_online_da3).train()
+                              "num_categories": len(dataset_config["data_groups"])}).train()
     lr = args.lr
     warmup_steps = args.warmup_steps
     batch_size = (probe_max_batch(policy, dataset, args.batch_size)
