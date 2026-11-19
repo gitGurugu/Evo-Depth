@@ -159,5 +159,6 @@ LITEGAUSS_CKPT=checkpoints/litegauss/overfit-spatial \
 ```
 
 默认日志：`LIBERO-evaluation/logs/litegauss_<suite>/`；带 `--name TAG` 则为 `…/litegauss_<suite>_<tag>/`（也可用 `--log-dir` / `LITEGAUSS_LOG_DIR`）。
+可用 `--task-ids 0` 只评测 Task 1（0-based，与训练 `task_indices` 一致）；省略则评测全部任务，episode 抽样不变。
 端口占用时先停掉旧 Evo/LiteGauss server（只杀对应 pid 文件里的进程）。
 

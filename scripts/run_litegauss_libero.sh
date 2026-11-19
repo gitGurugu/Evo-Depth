@@ -4,6 +4,7 @@
 #   bash scripts/run_litegauss_libero.sh
 #   bash scripts/run_litegauss_libero.sh libero_spatial
 #   bash scripts/run_litegauss_libero.sh libero_spatial --name overfit-spatial
+#   bash scripts/run_litegauss_libero.sh libero_spatial --task-ids 0 --name overfit-spatial-ep1
 #   LITEGAUSS_CKPT=checkpoints/litegauss/overfit-spatial \
 #     bash scripts/run_litegauss_libero.sh libero_spatial --name overfit-spatial
 #   bash scripts/run_litegauss_libero.sh libero_spatial --log-dir /tmp/my_eval
@@ -21,12 +22,22 @@ shift $(( $# > 0 ? 1 : 0 )) || true
 PORT="${EVO_DEPTH_SERVER_PORT:-9000}"
 CKPT="${LITEGAUSS_CKPT:-${LITEGAUSS_CKPT_DIR:-$ROOT/checkpoints/litegauss/run-bs224-400}}"
 RUN_NAME=""
+TASK_ARGS=()
 LOG_DIR="${LITEGAUSS_LOG_DIR:-}"
 SERVER_PY="$ROOT/.venv/bin/python"
 CLIENT_PY="$ROOT/LIBERO-evaluation/.venv-libero/bin/python"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --task-ids)
+      TASK_ARGS+=("$1")
+      shift
+      [[ $# -gt 0 && "$1" =~ ^-?[0-9]+$ ]] || { echo "--task-ids requires one or more integer task IDs" >&2; exit 1; }
+      while [[ $# -gt 0 && "$1" =~ ^-?[0-9]+$ ]]; do
+        TASK_ARGS+=("$1")
+        shift
+      done
+      ;;
     --name|--run-name)
       RUN_NAME="$2"
       shift 2
@@ -143,5 +154,6 @@ PYTHONPATH="${PYTHONPATH:-}:$ROOT/LIBERO-evaluation/LIBERO" \
   --task_suites "$SUITE" \
   --server_url "ws://127.0.0.1:${PORT}" \
   --log_file "$LOG_DIR/log.txt" \
-  --video_log_dir "$LOG_DIR/videos"
+  --video_log_dir "$LOG_DIR/videos" \
+  "${TASK_ARGS[@]}"
 log "Client finished. Log: ${LOG_DIR}/log.txt"

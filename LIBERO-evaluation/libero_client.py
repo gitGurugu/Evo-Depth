@@ -47,6 +47,10 @@ def get_args():
     parser.add_argument("--episodes", type=int, default=10)
     parser.add_argument("--seed", type=int, default=23)
     parser.add_argument(
+        "--task-ids", nargs="+", type=int, default=None,
+        help="0-based task IDs to evaluate (default: all tasks in each suite)",
+    )
+    parser.add_argument(
         "--task_suites",
         nargs="+",
         default=["libero_spatial"],
@@ -186,6 +190,15 @@ async def run(SERVER_URL: str, max_steps: int = None, num_episodes: int = None, 
     task_suite = benchmark_dict[task_suite_name]()
     num_tasks_in_suite = task_suite.n_tasks
 
+    task_ids = args.task_ids if args.task_ids is not None else list(range(num_tasks_in_suite))
+    for task_id in task_ids:
+        if not 0 <= task_id < num_tasks_in_suite:
+            raise ValueError(
+                f"Invalid --task-ids value {task_id} for {task_suite_name}: "
+                f"expected 0 <= task_id < {num_tasks_in_suite} (0-based)"
+            )
+    log.info(f"Selected task_ids for {task_suite_name} (0-based): {task_ids}")
+
     print(f"Numbers of tasks: {num_tasks_in_suite}")
 
     total_success = 0
@@ -202,7 +215,7 @@ async def run(SERVER_URL: str, max_steps: int = None, num_episodes: int = None, 
         log.info(f"Horizon is {horizon}")
         total_false = 0
         for task_id in tqdm(
-            range(num_tasks_in_suite),
+            task_ids,
             desc=f"[Suite {task_suite_name}] Tasks",
             leave=True
         ):
