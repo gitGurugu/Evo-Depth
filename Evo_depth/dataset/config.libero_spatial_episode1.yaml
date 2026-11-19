@@ -1,0 +1,24 @@
+# Pipeline overfit: libero_spatial Task1 / Episode1 only.
+# Eval client prints "Task 1 | Episode 1" for 0-based (task_id=0, ep=0).
+# Same dims/view_map as config.libero.yaml.
+#
+# Filter keys read by LiteGaussDataset.from_config:
+#   task_indices:    LeRobot meta task_index values (match cache prompt)
+#   episode_indices: LeRobot episode_index / episode_00000N cache stem
+#
+# Usage:
+#   DATASET_CONFIG=$PWD/Evo_depth/dataset/config.libero_spatial_episode1.yaml \
+#     bash scripts/run_litegauss_train.sh --name overfit-spatial-ep1 ...
+max_action_dim: 24
+max_state_dim: 24
+max_views: 3
+
+data_groups:
+  libero_franka:
+    libero_spatial_no_noops_1.0.0_lerobot:
+      path: /root/Evo-Depth/data/libero/libero_spatial_no_noops_1.0.0_lerobot
+      view_map:
+        image_1: observation.images.image
+        image_2: observation.images.wrist_image
+      task_indices: [0]
+      episode_indices: [0]

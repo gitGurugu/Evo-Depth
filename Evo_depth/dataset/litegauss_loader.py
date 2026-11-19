@@ -3,6 +3,7 @@
 Run this file directly for a CPU fake-data selfcheck, without videos or weights.
 """
 
+import pickle
 import sys
 from pathlib import Path
 
@@ -72,8 +73,50 @@ class LiteGaussDataset(Dataset):
         # Keep pandas/torchvision/video dependencies out of the fake selfcheck.
         from dataset.lerobot_dataset_pretrain_mp import LeRobotDataset
 
-        return cls(LeRobotDataset(config, image_size=448, action_horizon=action_horizon,
-                                 use_augmentation=False))
+        base = LeRobotDataset(config, image_size=448, action_horizon=action_horizon,
+                              use_augmentation=False)
+
+        filters = {}
+        for arm_name, group in config["data_groups"].items():
+            for dataset_name, dataset in group.items():
+                episode_indices = dataset.get("episode_indices")
+                task_indices = dataset.get("task_indices")
+                if episode_indices is None and task_indices is None:
+                    continue
+
+                episode_names = None
+                allowed_prompts = None
+                if episode_indices is not None:
+                    episode_names = {f"episode_{index:06d}" for index in episode_indices}
+                if task_indices is not None:
+                    allowed_prompts = {base.tasks[arm_name][dataset_name][index]
+                                       for index in task_indices}
+                filters[(arm_name, dataset_name)] = (episode_names, allowed_prompts)
+
+        if filters:
+            before = len(base.data)
+            filtered_data = []
+            for cache_path in base.data:
+                path = Path(cache_path)
+                episode_names, allowed_prompts = filters.get(
+                    (path.parents[3].name, path.parents[2].name), (None, None))
+                if episode_names is not None and path.parent.name not in episode_names:
+                    continue
+
+                if allowed_prompts is not None:
+                    with open(cache_path, "rb") as handle:
+                        item = pickle.load(handle)
+                    if item["prompt"] not in allowed_prompts:
+                        continue
+
+                filtered_data.append(cache_path)
+
+            print(f"LiteGauss subset filter: {before} -> {len(filtered_data)}")
+            if not filtered_data:
+                raise ValueError("Subset filters removed every sample")
+            base.data = filtered_data
+
+        return cls(base)
 
     def __len__(self):
         return len(self.base)
@@ -206,6 +249,7 @@ def selfcheck():
     assert torch.equal(single["K"][0], default_libero_Ks(order=("wrist",))[0])
     sample["image_mask"] = torch.tensor([True, True, False])
     assert "dataset.lerobot_dataset_pretrain_mp" not in sys.modules
+
     print("PASS: fake LIBERO loader; real RGB/K only; camera identity; (1,H,24) masks; no augmentation")
     return batch
 
