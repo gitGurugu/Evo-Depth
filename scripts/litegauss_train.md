@@ -37,6 +37,10 @@ checkpoints/litegauss/<name>/
 
 ## SwanLab
 
+- 每步新增 `grad_norm`（裁剪前梯度范数）和 `epoch`（按训练子集长度换算）；config 记录 `dataset_len` / `train_len` / `val_len`。
+- `--val-ratio` / `VAL_RATIO` 默认 `0.1`（须在 0 和 1 之间）：从同一过滤后数据集按固定随机种子划分样本，训练排除验证样本；至少保留 1 条训练样本，数据集仅 1 条时跳过验证。
+- `--val-interval` / `VAL_INTERVAL` 默认跟随正数 `--ckpt-interval`，否则为 `50`；每隔 N 步和最后一步记录并打印完整验证子集的 open-loop `val_loss`，不做闭环 rollout。
+
 - 默认项目名：**`litegauss`**（不是 `Evo-LiteGauss`）。
 - 要进以前的项目必须显式：`--swanlab-project Evo-LiteGauss`。
 - Run 名 = `--name`（与 ckpt 目录名一致）。

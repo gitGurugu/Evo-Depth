@@ -25,6 +25,8 @@ BATCH_SIZE="${BATCH_SIZE:-16}"
 LR="${LR:-1e-4}"
 WARMUP_STEPS="${WARMUP_STEPS:-1000}"
 CKPT_INTERVAL="${CKPT_INTERVAL:-0}"
+VAL_RATIO="${VAL_RATIO:-0.1}"
+VAL_INTERVAL="${VAL_INTERVAL:-}"
 RESUME="${RESUME:-}"
 OUTPUT="${OUTPUT:-}"
 CONFIG_JSON="${CONFIG_JSON:-}"
@@ -66,6 +68,8 @@ while [[ $# -gt 0 ]]; do
     --lr) LR="$2"; shift 2 ;;
     --warmup-steps|--warmup_steps) WARMUP_STEPS="$2"; shift 2 ;;
     --ckpt-interval|--ckpt_interval) CKPT_INTERVAL="$2"; shift 2 ;;
+    --val-ratio) VAL_RATIO="$2"; shift 2 ;;
+    --val-interval) VAL_INTERVAL="$2"; shift 2 ;;
     --resume) RESUME="$2"; shift 2 ;;
     --output) OUTPUT="$2"; shift 2 ;;
     --name|--run-name) RUN_NAME="$2"; shift 2 ;;
@@ -130,12 +134,14 @@ cmd=(
   --lr "$LR"
   --warmup_steps "$WARMUP_STEPS"
   --ckpt-interval "$CKPT_INTERVAL"
+  --val-ratio "$VAL_RATIO"
   --output "$OUTPUT"
   --swanlab-project "$SWANLAB_PROJECT"
   --swanlab-run "$RUN_NAME"
 )
 [[ -n "$CONFIG_JSON" ]] && cmd+=(--config "$CONFIG_JSON")
 [[ -n "$RESUME" ]] && cmd+=(--resume "$RESUME")
+[[ -n "$VAL_INTERVAL" ]] && cmd+=(--val-interval "$VAL_INTERVAL")
 [[ "$NO_SWANLAB" -eq 1 ]] && cmd+=(--no-swanlab)
 [[ "$PROBE_MAX_BATCH" -eq 1 ]] && cmd+=(--probe-max-batch)
 

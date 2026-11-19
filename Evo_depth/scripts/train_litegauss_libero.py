@@ -28,7 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import torch
 from torch.optim.lr_scheduler import LambdaLR
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, random_split
 
 from dataset.litegauss_loader import LiteGaussDataset, collate_litegauss, selfcheck
 
@@ -272,6 +272,10 @@ def main():
         type=Path,
         help="Resume from a LiteGauss checkpoint dir (loads gst/action_head/optimizer + step)",
     )
+    parser.add_argument("--val-ratio", type=float, default=0.1,
+                        help="Validation fraction of the filtered dataset (default: 0.1)")
+    parser.add_argument("--val-interval", type=int,
+                        help="Validate every N steps and at the final step (default: ckpt interval or 50)")
     parser.add_argument("--swanlab-project", default=os.environ.get("SWANLAB_PROJECT", "litegauss"))
     parser.add_argument("--swanlab-run", default=os.environ.get("SWANLAB_RUN", None),
                         help="SwanLab run name; default litegauss-stepsN")
@@ -286,7 +290,8 @@ def main():
         if (args.dataset_config_path or args.config or args.output or args.steps != 1
                 or args.export_from_pt or args.batch_size != 16 or args.num_workers != 0
                 or args.lr != 1e-4 or args.warmup_steps != 1000 or args.probe_max_batch
-                or args.ckpt_interval != 0 or args.resume):
+                or args.ckpt_interval != 0 or args.resume
+                or args.val_ratio != 0.1 or args.val_interval is not None):
             parser.error("--selfcheck cannot be combined with training arguments")
         batch = selfcheck()
         # Reuse the existing mocks, exercising the real GST/action head at 24 dims.
@@ -308,8 +313,16 @@ def main():
                 assert parameter.grad is not None and torch.isfinite(parameter.grad).all()
             else:
                 assert parameter.grad is None
+        grad_norm = torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0, error_if_nonfinite=True)
+        assert grad_norm.ndim == 0 and torch.isfinite(grad_norm)
         optimizer.step()
         assert not torch.equal(before, policy.litegauss.gst.queries)
+        policy.eval()
+        with torch.no_grad():
+            val_loss = policy.train_step(**batch)
+        policy.train()
+        assert val_loss.ndim == 0 and torch.isfinite(val_loss) and not val_loss.requires_grad
+        assert policy.training and not policy.litegauss.embedder.training and not policy.litegauss.depth.training
         print(f"PASS: loader -> 24-dim policy loss/backward/optimizer; loss={loss.item():.6f}")
         check_true_batch(policy, batch, {**batch, "state": batch["state"] + 0.25})
         check_probe(policy, batch)
@@ -318,7 +331,8 @@ def main():
     if args.export_from_pt is not None:
         if (args.steps != 1 or args.config or args.swanlab_run or args.no_swanlab
                 or args.batch_size != 16 or args.lr != 1e-4 or args.warmup_steps != 1000
-                or args.probe_max_batch or args.ckpt_interval != 0 or args.resume):
+                or args.probe_max_batch or args.ckpt_interval != 0 or args.resume
+                or args.val_ratio != 0.1 or args.val_interval is not None):
             parser.error("--export-from-pt only uses --dataset_config_path and --output")
         if args.dataset_config_path is None or not args.dataset_config_path.is_file():
             parser.error("--dataset_config_path must name an existing file")
@@ -365,6 +379,13 @@ def main():
         parser.error("--warmup_steps must be >= 0")
     if args.ckpt_interval < 0:
         parser.error("--ckpt-interval must be >= 0")
+    if not 0 < args.val_ratio < 1:
+        parser.error("--val-ratio must be between 0 and 1 (exclusive)")
+    if args.val_interval is not None and args.val_interval < 1:
+        parser.error("--val-interval must be positive")
+    val_interval = args.val_interval
+    if val_interval is None:
+        val_interval = args.ckpt_interval if args.ckpt_interval > 0 else 50
     if args.num_workers < 0:
         parser.error("--num_workers must be >= 0")
     if args.dataset_config_path is None or not args.dataset_config_path.is_file():
@@ -388,9 +409,17 @@ def main():
     dataset = LiteGaussDataset.from_config(dataset_config, action_horizon=horizon)
     if not len(dataset):
         raise ValueError("LIBERO dataset is empty")
-    if len(dataset) < args.batch_size and not args.probe_max_batch:
+    val_len = min(len(dataset) - 1, max(1, int(len(dataset) * args.val_ratio)))
+    train_dataset, val_dataset = dataset, []
+    if val_len:
+        train_dataset, val_dataset = random_split(
+            dataset, [len(dataset) - val_len, val_len], generator=torch.Generator().manual_seed(0),
+        )
+    else:
+        print("val: dataset has only 1 sample; skipping validation")
+    if len(train_dataset) < args.batch_size and not args.probe_max_batch:
         raise ValueError(
-            f"dataset length {len(dataset)} < batch_size {args.batch_size}; lower --batch_size"
+            f"train dataset length {len(train_dataset)} < batch_size {args.batch_size}; lower --batch_size"
         )
     norm_stats = _norm_stats_from_dataset(dataset)
     policy = LiteGaussPolicy({**config, "device": "cuda", "state_dim": 24, "per_action_dim": 24,
@@ -398,7 +427,7 @@ def main():
                               "num_categories": len(dataset_config["data_groups"])}).train()
     lr = args.lr
     warmup_steps = args.warmup_steps
-    batch_size = (probe_max_batch(policy, dataset, args.batch_size)
+    batch_size = (probe_max_batch(policy, train_dataset, args.batch_size)
                   if args.probe_max_batch else args.batch_size)
     optimizer = torch.optim.AdamW((p for p in policy.parameters() if p.requires_grad), lr=lr)
     step = 0
@@ -459,11 +488,15 @@ def main():
                 "resume": str(args.resume) if args.resume else None,
                 "resume_step": step,
                 "dataset_len": len(dataset),
+                "train_len": len(train_dataset),
+                "val_len": len(val_dataset),
+                "val_ratio": args.val_ratio,
+                "val_interval": val_interval,
                 **{k: config[k] for k in config},
             },
         )
     loader = DataLoader(
-        dataset,
+        train_dataset,
         batch_size=batch_size,
         shuffle=True,
         num_workers=args.num_workers,
@@ -471,11 +504,20 @@ def main():
         drop_last=True,
         persistent_workers=args.num_workers > 0,
     )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        num_workers=args.num_workers,
+        collate_fn=collate_litegauss,
+        drop_last=False,
+        persistent_workers=args.num_workers > 0,
+    )
     print(
         f"train: steps={args.steps} start_step={step} batch_size={batch_size} lr={lr} "
         f"warmup_steps={warmup_steps} ckpt_interval={args.ckpt_interval} "
         f"schedule=warmup_cosine "
-        f"dataset_len={len(dataset)} (~{args.steps * batch_size / len(dataset):.4f} epoch)"
+        f"dataset_len={len(dataset)} train_len={len(train_dataset)} val_len={val_len} "
+        f"val_interval={val_interval} (~{args.steps * batch_size / len(train_dataset):.4f} epoch)"
     )
     while step < args.steps:
         for batch in loader:
@@ -486,7 +528,7 @@ def main():
             if not torch.isfinite(loss):
                 raise RuntimeError("non-finite loss")
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(
+            grad_norm = torch.nn.utils.clip_grad_norm_(
                 (p for p in policy.parameters() if p.requires_grad),
                 1.0,
                 error_if_nonfinite=True,
@@ -497,14 +539,35 @@ def main():
             loss_v = loss.item()
             lr_now = scheduler.get_last_lr()[0]
             print(f"step={step} loss={loss_v:.6f} lr={lr_now:.6e} batch_size={batch_size}")
+            metrics = {
+                "step": step,
+                "loss": loss_v,
+                "learning_rate": lr_now,
+                "batch_size": batch_size,
+                "samples_seen": step * batch_size,
+                "grad_norm": grad_norm.item(),
+                "epoch": step * batch_size / len(train_dataset),
+            }
+            if val_len and (step % val_interval == 0 or step == args.steps):
+                policy.eval()
+                try:
+                    val_loss = 0.0
+                    val_samples = 0
+                    with torch.no_grad():
+                        for val_batch in val_loader:
+                            batch_loss = policy.train_step(**val_batch)
+                            if not torch.isfinite(batch_loss):
+                                raise RuntimeError("non-finite val loss")
+                            val_batch_size = val_batch["actions_gt"].shape[0]
+                            val_loss += batch_loss.item() * val_batch_size
+                            val_samples += val_batch_size
+                    val_loss /= val_samples
+                finally:
+                    policy.train()
+                metrics["val_loss"] = val_loss
+                print(f"step={step} val_loss={val_loss:.6f}")
             if use_swanlab:
-                swanlab.log({
-                    "step": step,
-                    "loss": loss_v,
-                    "learning_rate": lr_now,
-                    "batch_size": batch_size,
-                    "samples_seen": step * batch_size,
-                })
+                swanlab.log(metrics)
             if (
                 args.output
                 and args.ckpt_interval > 0
