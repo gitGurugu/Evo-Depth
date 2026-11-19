@@ -5,10 +5,13 @@
 #   bash scripts/run_litegauss_train.sh --name run2-5k --steps 5000
 #   bash scripts/run_litegauss_train.sh --name smoke --steps 100 --batch-size 16
 #   bash scripts/run_litegauss_train.sh --name auto --batch-size 64 --probe-max-batch
+#   bash scripts/run_litegauss_train.sh --name r1 --steps 1000 --ckpt-interval 200
+#   bash scripts/run_litegauss_train.sh --name r1 --steps 1000 --resume checkpoints/litegauss/r1/step_400
 # --probe-max-batch: find largest true B <= --batch-size fitting CUDA VRAM before training.
 #   DATASET_CONFIG=/path/to/config.libero.yaml bash scripts/run_litegauss_train.sh --name x --steps 100
 #
 # Checkpoint dir: checkpoints/litegauss/<name>/{config.json,norm_stats.json,model.pt}
+# Mid-saves: checkpoints/litegauss/<name>/step_<N>/ when --ckpt-interval N > 0
 # Needs: setup_train_server.sh (.venv), setup_dataset.sh (config + data) for real runs.
 # See scripts/litegauss_train.md for full command recipes.
 
@@ -21,6 +24,8 @@ STEPS="${STEPS:-100}"
 BATCH_SIZE="${BATCH_SIZE:-16}"
 LR="${LR:-1e-4}"
 WARMUP_STEPS="${WARMUP_STEPS:-1000}"
+CKPT_INTERVAL="${CKPT_INTERVAL:-0}"
+RESUME="${RESUME:-}"
 OUTPUT="${OUTPUT:-}"
 CONFIG_JSON="${CONFIG_JSON:-}"
 RUN_NAME="${RUN_NAME:-${SWANLAB_RUN:-}}"
@@ -60,6 +65,8 @@ while [[ $# -gt 0 ]]; do
     --probe-max-batch) PROBE_MAX_BATCH=1; shift ;;
     --lr) LR="$2"; shift 2 ;;
     --warmup-steps|--warmup_steps) WARMUP_STEPS="$2"; shift 2 ;;
+    --ckpt-interval|--ckpt_interval) CKPT_INTERVAL="$2"; shift 2 ;;
+    --resume) RESUME="$2"; shift 2 ;;
     --output) OUTPUT="$2"; shift 2 ;;
     --name|--run-name) RUN_NAME="$2"; shift 2 ;;
     --swanlab-project) SWANLAB_PROJECT="$2"; shift 2 ;;
@@ -100,8 +107,13 @@ RUN_NAME="$(sanitize_name "$RUN_NAME")"
 if [[ -z "$OUTPUT" ]]; then
   OUTPUT="$ROOT/checkpoints/litegauss/${RUN_NAME}"
 fi
-if [[ -e "$OUTPUT" ]]; then
-  echo "checkpoint path already exists (refusing overwrite): $OUTPUT" >&2
+if [[ -f "$OUTPUT/model.pt" && -z "$RESUME" ]]; then
+  echo "checkpoint path already has model.pt (refusing overwrite): $OUTPUT" >&2
+  echo "use a new --name, or --resume <step_dir> to continue" >&2
+  exit 1
+fi
+if [[ -n "$RESUME" && ! -f "$RESUME/model.pt" ]]; then
+  echo "missing resume checkpoint: $RESUME/model.pt" >&2
   exit 1
 fi
 
@@ -117,16 +129,18 @@ cmd=(
   --batch-size "$BATCH_SIZE"
   --lr "$LR"
   --warmup_steps "$WARMUP_STEPS"
+  --ckpt-interval "$CKPT_INTERVAL"
   --output "$OUTPUT"
   --swanlab-project "$SWANLAB_PROJECT"
   --swanlab-run "$RUN_NAME"
 )
 [[ -n "$CONFIG_JSON" ]] && cmd+=(--config "$CONFIG_JSON")
+[[ -n "$RESUME" ]] && cmd+=(--resume "$RESUME")
 [[ "$NO_SWANLAB" -eq 1 ]] && cmd+=(--no-swanlab)
 [[ "$PROBE_MAX_BATCH" -eq 1 ]] && cmd+=(--probe-max-batch)
 
 mkdir -p "$(dirname "$OUTPUT")"
 
-log "LiteGauss train name=$RUN_NAME steps=$STEPS batch_size=$BATCH_SIZE lr=$LR warmup_steps=$WARMUP_STEPS output=$OUTPUT project=$SWANLAB_PROJECT"
+log "LiteGauss train name=$RUN_NAME steps=$STEPS batch_size=$BATCH_SIZE lr=$LR warmup_steps=$WARMUP_STEPS ckpt_interval=$CKPT_INTERVAL output=$OUTPUT project=$SWANLAB_PROJECT${RESUME:+ resume=$RESUME}"
 "${cmd[@]}"
 log "Done. checkpoint dir=$OUTPUT (config.json, norm_stats.json, model.pt)"

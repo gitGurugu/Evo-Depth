@@ -26,10 +26,14 @@ bash scripts/run_litegauss_train.sh ...
 checkpoints/litegauss/<name>/
   config.json       # 策略配置 + run 元数据（含 batch_size）
   norm_stats.json   # 与 Evo server 同款归一化统计（单 robot key）
-  model.pt          # gst + action_head（+ optimizer）
+  model.pt          # gst + action_head（+ optimizer）；训练结束写入
+  step_200/         # --ckpt-interval 200 时的中途保存（同三件套）
+  step_400/
 ```
 
-换实验就换 `--name`；目录已存在会拒绝覆盖。
+- `--ckpt-interval N`：每 N 步写一次 `step_N/`（`0`=只存最终）。
+- 断了续跑：`--resume checkpoints/litegauss/<name>/step_400`，同一 `--name`，`--steps` 仍是**总步数**（不是再加 N 步）。
+- 换实验就换 `--name`；根目录已有 `model.pt` 且未 `--resume` 会拒绝覆盖。
 
 ## SwanLab
 
@@ -114,6 +118,8 @@ bash scripts/run_litegauss_train.sh \
 | `--probe-max-batch` | 训前找 ≤`--batch-size` 的最大可跑真 B | 关 |
 | `--lr` / `LR` | 峰值学习率 | `1e-4` |
 | `--warmup-steps` / `WARMUP_STEPS` | 线性 warmup，随后 cosine | `1000` |
+| `--ckpt-interval` / `CKPT_INTERVAL` | 每 N 步存 `output/step_N/`；`0` 只存最终 | `0` |
+| `--resume` / `RESUME` | 从某 checkpoint 目录续训（读 step + 权重 + optimizer） | 关 |
 | `--output` | 手动指定 checkpoint 目录 | `checkpoints/litegauss/<name>/` |
 | `--swanlab-project` / `SWANLAB_PROJECT` | SwanLab 项目 | `litegauss` |
 | `--no-swanlab` / `SWANLAB_MODE=disabled` | 关闭上传 | 默认 cloud |

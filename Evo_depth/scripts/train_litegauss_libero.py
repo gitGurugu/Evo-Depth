@@ -137,10 +137,11 @@ def check_probe(policy, sample):
     print("PASS: probe OOM search/top-fit/dataset cap/B=1 failure/non-OOM propagation; weights unchanged")
 
 
-def get_lr_lambda(warmup_steps, total_steps):
+def get_lr_lambda(warmup_steps, total_steps, resume_step=0):
     """Same schedule as Evo train.py: linear warmup, then cosine to 0."""
 
     def lr_lambda(current_step):
+        current_step = current_step + resume_step
         if current_step < warmup_steps:
             return current_step / max(1, warmup_steps)
         progress = (current_step - warmup_steps) / max(1, total_steps - warmup_steps)
@@ -175,16 +176,16 @@ def save_checkpoint_dir(
     gst_state,
     action_head_state,
     optimizer_state=None,
+    step=None,
 ):
-    """Write Evo-style sidecars + LiteGauss weights; refuses overwrite."""
+    """Write Evo-style sidecars + LiteGauss weights; refuses overwrite of CKPT_FILES."""
     output_dir = Path(output_dir)
-    if output_dir.exists():
-        existing = [name for name in CKPT_FILES if (output_dir / name).exists()]
-        if existing or any(output_dir.iterdir()):
-            raise FileExistsError(
-                f"checkpoint dir already exists or is non-empty: {output_dir} ({existing or 'files present'})"
-            )
-    output_dir.mkdir(parents=True, exist_ok=False)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    existing = [name for name in CKPT_FILES if (output_dir / name).exists()]
+    if existing:
+        raise FileExistsError(
+            f"checkpoint dir already has {existing}: {output_dir}"
+        )
     export_config = {
         **dict(policy_config or {}),
         "model_type": "litegauss",
@@ -194,6 +195,8 @@ def save_checkpoint_dir(
         "dataset_config_path": str(dataset_config_path),
         "camera_order": list(camera_order),
     }
+    if step is not None:
+        export_config["step"] = int(step)
     (output_dir / "config.json").write_text(
         json.dumps(export_config, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
     )
@@ -208,11 +211,30 @@ def save_checkpoint_dir(
         run_name=run_name,
         steps=steps,
     )
+    if step is not None:
+        payload["step"] = int(step)
     if optimizer_state is not None:
         payload["optimizer"] = optimizer_state
     with (output_dir / "model.pt").open("xb") as handle:
         torch.save(payload, handle)
     return output_dir
+
+
+def load_trainable_checkpoint(policy, optimizer, ckpt_dir):
+    """Load gst / action_head / optimizer from a LiteGauss checkpoint directory."""
+    ckpt_dir = Path(ckpt_dir)
+    model_path = ckpt_dir / "model.pt"
+    if not model_path.is_file():
+        raise FileNotFoundError(f"missing {model_path}")
+    payload = torch.load(model_path, map_location="cpu", weights_only=False)
+    if not isinstance(payload, dict) or "gst" not in payload or "action_head" not in payload:
+        raise ValueError(f"invalid LiteGauss checkpoint: {model_path}")
+    policy.litegauss.gst.load_state_dict(payload["gst"])
+    policy.litegauss.action_head.load_state_dict(payload["action_head"])
+    if "optimizer" in payload and payload["optimizer"] is not None:
+        optimizer.load_state_dict(payload["optimizer"])
+    step = int(payload.get("step") or 0)
+    return step, payload
 
 
 def main():
@@ -236,7 +258,19 @@ def main():
     parser.add_argument(
         "--output",
         type=Path,
-        help="NEW checkpoint directory (writes config.json, norm_stats.json, model.pt)",
+        help="Checkpoint directory (final files + optional step_N/ mid-saves)",
+    )
+    parser.add_argument(
+        "--ckpt-interval",
+        "--ckpt_interval",
+        type=int,
+        default=0,
+        help="Save mid-run checkpoint every N steps under output/step_N/ (0=only final)",
+    )
+    parser.add_argument(
+        "--resume",
+        type=Path,
+        help="Resume from a LiteGauss checkpoint dir (loads gst/action_head/optimizer + step)",
     )
     parser.add_argument("--swanlab-project", default=os.environ.get("SWANLAB_PROJECT", "litegauss"))
     parser.add_argument("--swanlab-run", default=os.environ.get("SWANLAB_RUN", None),
@@ -251,7 +285,8 @@ def main():
     if args.selfcheck:
         if (args.dataset_config_path or args.config or args.output or args.steps != 1
                 or args.export_from_pt or args.batch_size != 16 or args.num_workers != 0
-                or args.lr != 1e-4 or args.warmup_steps != 1000 or args.probe_max_batch):
+                or args.lr != 1e-4 or args.warmup_steps != 1000 or args.probe_max_batch
+                or args.ckpt_interval != 0 or args.resume):
             parser.error("--selfcheck cannot be combined with training arguments")
         batch = selfcheck()
         # Reuse the existing mocks, exercising the real GST/action head at 24 dims.
@@ -283,7 +318,7 @@ def main():
     if args.export_from_pt is not None:
         if (args.steps != 1 or args.config or args.swanlab_run or args.no_swanlab
                 or args.batch_size != 16 or args.lr != 1e-4 or args.warmup_steps != 1000
-                or args.probe_max_batch):
+                or args.probe_max_batch or args.ckpt_interval != 0 or args.resume):
             parser.error("--export-from-pt only uses --dataset_config_path and --output")
         if args.dataset_config_path is None or not args.dataset_config_path.is_file():
             parser.error("--dataset_config_path must name an existing file")
@@ -313,6 +348,7 @@ def main():
             gst_state=payload["gst"],
             action_head_state=payload["action_head"],
             optimizer_state=payload.get("optimizer"),
+            step=payload.get("step"),
         )
         print(f"exported checkpoint dir={out}")
         for name in CKPT_FILES:
@@ -327,14 +363,20 @@ def main():
         parser.error("--lr must be positive")
     if args.warmup_steps < 0:
         parser.error("--warmup_steps must be >= 0")
+    if args.ckpt_interval < 0:
+        parser.error("--ckpt-interval must be >= 0")
     if args.num_workers < 0:
         parser.error("--num_workers must be >= 0")
     if args.dataset_config_path is None or not args.dataset_config_path.is_file():
         parser.error("--dataset_config_path must name an existing file")
     if args.config and not args.config.is_file():
         parser.error("--config must name an existing file")
-    if args.output and args.output.exists():
-        parser.error("--output already exists; only new checkpoint directories may be written")
+    if args.resume is not None and not (args.resume / "model.pt").is_file():
+        parser.error(f"--resume missing model.pt: {args.resume}")
+    if args.ckpt_interval > 0 and args.output is None:
+        parser.error("--ckpt-interval requires --output")
+    if args.output and (args.output / "model.pt").exists() and args.resume is None:
+        parser.error("--output already has model.pt; use a new --name or --resume")
     if not torch.cuda.is_available():
         parser.error("Real training requires CUDA and installed InternVL/DA3 dependencies")
     import yaml
@@ -359,12 +401,45 @@ def main():
     batch_size = (probe_max_batch(policy, dataset, args.batch_size)
                   if args.probe_max_batch else args.batch_size)
     optimizer = torch.optim.AdamW((p for p in policy.parameters() if p.requires_grad), lr=lr)
-    scheduler = LambdaLR(optimizer, get_lr_lambda(warmup_steps, args.steps))
+    step = 0
+    if args.resume is not None:
+        step, _ = load_trainable_checkpoint(policy, optimizer, args.resume)
+        print(f"resume: loaded {args.resume} at step={step}")
+    if step >= args.steps:
+        parser.error(f"--resume step {step} >= --steps {args.steps}; raise --steps")
+    scheduler = LambdaLR(optimizer, get_lr_lambda(warmup_steps, args.steps, resume_step=step))
     run_name = args.swanlab_run or f"litegauss-steps{args.steps}"
     use_swanlab = (
         not args.no_swanlab
         and os.environ.get("SWANLAB_MODE", "cloud") != "disabled"
     )
+    policy_config = {
+        **policy.config,
+        "batch_size": batch_size,
+        "warmup_steps": warmup_steps,
+        "lr_schedule": "warmup_cosine",
+    }
+    if args.output:
+        args.output.mkdir(parents=True, exist_ok=True)
+
+    def write_checkpoint(target_dir, current_step):
+        out = save_checkpoint_dir(
+            target_dir,
+            norm_stats=norm_stats,
+            run_name=run_name,
+            steps=args.steps,
+            lr=lr,
+            dataset_config_path=args.dataset_config_path,
+            camera_order=dataset.camera_order,
+            policy_config=policy_config,
+            gst_state=policy.litegauss.gst.state_dict(),
+            action_head_state=policy.litegauss.action_head.state_dict(),
+            optimizer_state=optimizer.state_dict(),
+            step=current_step,
+        )
+        print(f"saved checkpoint dir={out} step={current_step}")
+        return out
+
     if use_swanlab:
         import swanlab
         swanlab.init(
@@ -380,6 +455,9 @@ def main():
                 "action_horizon": horizon,
                 "dataset_config_path": str(args.dataset_config_path),
                 "output": str(args.output) if args.output else None,
+                "ckpt_interval": args.ckpt_interval,
+                "resume": str(args.resume) if args.resume else None,
+                "resume_step": step,
                 "dataset_len": len(dataset),
                 **{k: config[k] for k in config},
             },
@@ -394,11 +472,11 @@ def main():
         persistent_workers=args.num_workers > 0,
     )
     print(
-        f"train: steps={args.steps} batch_size={batch_size} lr={lr} "
-        f"warmup_steps={warmup_steps} schedule=warmup_cosine "
+        f"train: steps={args.steps} start_step={step} batch_size={batch_size} lr={lr} "
+        f"warmup_steps={warmup_steps} ckpt_interval={args.ckpt_interval} "
+        f"schedule=warmup_cosine "
         f"dataset_len={len(dataset)} (~{args.steps * batch_size / len(dataset):.4f} epoch)"
     )
-    step = 0
     while step < args.steps:
         for batch in loader:
             if step >= args.steps:
@@ -427,26 +505,21 @@ def main():
                     "batch_size": batch_size,
                     "samples_seen": step * batch_size,
                 })
+            if (
+                args.output
+                and args.ckpt_interval > 0
+                and step % args.ckpt_interval == 0
+                and step < args.steps
+            ):
+                write_checkpoint(args.output / f"step_{step}", step)
     if args.output:
-        out = save_checkpoint_dir(
-            args.output,
-            norm_stats=norm_stats,
-            run_name=run_name,
-            steps=args.steps,
-            lr=lr,
-            dataset_config_path=args.dataset_config_path,
-            camera_order=dataset.camera_order,
-            policy_config={
-                **policy.config,
-                "batch_size": batch_size,
-                "warmup_steps": warmup_steps,
-                "lr_schedule": "warmup_cosine",
-            },
-            gst_state=policy.litegauss.gst.state_dict(),
-            action_head_state=policy.litegauss.action_head.state_dict(),
-            optimizer_state=optimizer.state_dict(),
-        )
-        print(f"saved checkpoint dir={out}")
+        # Resume into the same run dir may already have a prior final model.pt.
+        if args.resume is not None:
+            for name in CKPT_FILES:
+                path = args.output / name
+                if path.exists():
+                    path.unlink()
+        out = write_checkpoint(args.output, step)
         for name in CKPT_FILES:
             print(f"  - {out / name}")
     if use_swanlab:

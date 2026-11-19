@@ -64,6 +64,7 @@ ssh LiteGauss
 ## 工作约定
 
 - **有 Codex 可用时**：编码实现优先交给 Codex；主 Agent 负责任务拆解、约束对齐（本文）、审查 diff、跑通验证、以及按开发流程 commit/push。Codex 不可用或任务只是改文档/查状态时，主 Agent 自己做即可。
+- **Codex 调用方式**：本环境没有 Codex MCP；用 Claude Codex 插件的 `codex-companion` / `codex-rescue` 转发。默认：`--model gpt-6.1-sol --effort high`（用户另指定时再改）。
 - 改动尽量小；复用 Evo 时是 **抄思路**，不是去改 Evo 文件
 - 不要为了「整洁」去改无关的评测文档或虚拟环境布局
 - 训练约定：冻结 InternVL + DA3；只训 GST + flow action head（除非用户另说）
