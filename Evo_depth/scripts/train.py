@@ -403,14 +403,16 @@ def train(config):
 
 
     if accelerator.is_main_process:
-        
-        inspect_named_submodules({
+        named_modules = {
             "vision_model": model.embedder.model.vision_model,
             "language_model": model.embedder.model.language_model,
-            "da3_embedder" : model.embedder.dpt_embedder,
-            "film_fuser" : model.embedder.dpt_linear_film ,
-            "action_head": model.action_head
-        })
+            "action_head": model.action_head,
+        }
+        # dpt_* only exist when --use_da3; skip them for VLM+head baseline.
+        if getattr(model.embedder, "use_da3", False):
+            named_modules["da3_embedder"] = model.embedder.dpt_embedder
+            named_modules["film_fuser"] = model.embedder.dpt_linear_film
+        inspect_named_submodules(named_modules)
 
     # === Training Loop ===
     while step < max_steps:
