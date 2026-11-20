@@ -9,6 +9,10 @@ import math
 import imageio
 import random
 import argparse
+import sys
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "LIBERO-PLUS-evaluation"))
+from eval_metrics import new_episode_metrics, record_step, save_episode_metrics
 os.environ["MUJOCO_GL"] = "osmesa"
 from tqdm import tqdm
 from libero.libero import benchmark, get_libero_path
@@ -74,6 +78,8 @@ def get_args():
     )
     parser.add_argument("--log_file", type=str, default=None, help="Log file path")
     parser.add_argument("--video_log_dir", type=str, default=None, help="Video save directory")
+    parser.add_argument("--save_metrics", action="store_true", default=True, help="Save per-step JSON beside videos (default)")
+    parser.add_argument("--no-save_metrics", action="store_false", dest="save_metrics", help="Disable metrics collection")
 
     parsed = parser.parse_args()
 
@@ -261,9 +267,15 @@ async def run(SERVER_URL: str, max_steps: int = None, num_episodes: int = None, 
                 state_id = state_ids[ep]
                 obs = env.set_init_state(initial_states[state_id])
                 env.sim.forward()
+                metrics = new_episode_metrics(
+                    env, suite=task_suite_name, task_id=int(task_id), episode=ep + 1,
+                    initial_state_id=int(state_id), task_description=str(task_description),
+                ) if args.save_metrics else None
                 t = 0
                 while t < 10:
                         obs, reward, done, info = env.step(LIBERO_DUMMY_ACTION)
+                        if metrics is not None:
+                            record_step(metrics, env, obs, LIBERO_DUMMY_ACTION, phase="settle")
                         t += 1
                         
 
@@ -307,6 +319,8 @@ async def run(SERVER_URL: str, max_steps: int = None, num_episodes: int = None, 
                             episode_done = False
                             break
 
+                        if metrics is not None:
+                            record_step(metrics, env, obs, action[:7])
                         
                         frame = np.hstack([
                             np.rot90(obs["agentview_image"], 2),
@@ -326,6 +340,13 @@ async def run(SERVER_URL: str, max_steps: int = None, num_episodes: int = None, 
                         break
 
                 # 保存视频（文件名带 task_id）
+                if metrics is not None:
+                    summary = save_episode_metrics(
+                        metrics, f"{args.video_log_dir}/{task_suite_name}/task{task_id+1}_episode{ep+1}.mp4",
+                        episode_done,
+                    )
+                    log.info(f"Task {task_id+1} | Episode {ep+1} metrics: {summary}")
+
                 save_video(frames, f"task{task_id+1}_episode{ep+1}.mp4", fps=30, save_dir=f"{args.video_log_dir}/{task_suite_name}")
 
                 if episode_done:
