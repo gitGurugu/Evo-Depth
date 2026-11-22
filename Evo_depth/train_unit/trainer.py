@@ -124,10 +124,14 @@ def save_checkpoint(save_dir, step, model, optimizer, scheduler, accelerator, ad
 
 def load_checkpoint_with_deepspeed(model, resume_path, resume_pretrain=False):
     checkpoint_path = Path(resume_path)
+    # resume_pretrain: module-only warm start. Stage changes (e.g. finetune_da3)
+    # alter ZeRO param layout; loading optim shards then raises parameter-alignment errors.
     load_path, client_state = model.load_checkpoint(
         str(checkpoint_path.parent), tag=checkpoint_path.name,
-        load_module_strict=True, load_optimizer_states=not resume_pretrain,
+        load_module_strict=True,
+        load_optimizer_states=not resume_pretrain,
         load_lr_scheduler_states=False,
+        load_module_only=resume_pretrain,
     )
     if load_path is None:
         raise ValueError(f"DeepSpeed checkpoint not found: {resume_path}")
@@ -279,13 +283,15 @@ class Trainer:
                     scheduler.step()
                     step += 1
                     loss_value = accelerator.reduce(loss.detach(), reduction="mean").item()
-
+                    grad_norm = float(grad_norm)
+                    metrics = {"step": step, "loss": loss_value, "lr": learning_rate,
+                               "learning_rate": learning_rate, "grad_norm": grad_norm}
+                    if batches_per_epoch:
+                        metrics["current_epoch"] = step / batches_per_epoch
+                    # SwanLab every step; terminal/file follow log_interval.
+                    if swanlab is not None:
+                        swanlab.log(metrics)
                     if step % config.log_interval == 0:
-                        grad_norm = float(grad_norm)
-                        metrics = {"step": step, "loss": loss_value, "lr": learning_rate,
-                                   "learning_rate": learning_rate, "grad_norm": grad_norm}
-                        if batches_per_epoch:
-                            metrics["current_epoch"] = step / batches_per_epoch
                         message = f"[{config.run_name}] " + " ".join(
                             f"{name}={value:.6g}" for name, value in metrics.items()
                             if name != "learning_rate"
@@ -293,8 +299,6 @@ class Trainer:
                         accelerator.print(message)
                         if accelerator.is_main_process:
                             logger.info(message)
-                        if swanlab is not None:
-                            swanlab.log(metrics)
 
                     # All ranks see the same reduced loss and enter DS shard saving together.
                     if loss_value < best_loss:

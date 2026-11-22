@@ -1,25 +1,30 @@
 # Written by setup_dataset.sh. Do not change max_action_dim, max_state_dim, max_views.
+# 数据量来自各目录 meta/info.json（no_noops LeRobot 版）。
 max_action_dim: 24
 max_state_dim: 24
 max_views: 3
 
 data_groups:
   libero_franka:
+    # 432 episodes / 52,970 frames / 10 tasks
     libero_spatial_no_noops_1.0.0_lerobot:
       path: /root/Evo-Depth/data/libero/libero_spatial_no_noops_1.0.0_lerobot
       view_map:
         image_1: observation.images.image
         image_2: observation.images.wrist_image
+    # 454 episodes / 66,984 frames / 10 tasks
     libero_object_no_noops_1.0.0_lerobot:
       path: /root/Evo-Depth/data/libero/libero_object_no_noops_1.0.0_lerobot
       view_map:
         image_1: observation.images.image
         image_2: observation.images.wrist_image
+    # 428 episodes / 52,042 frames / 10 tasks
     libero_goal_no_noops_1.0.0_lerobot:
       path: /root/Evo-Depth/data/libero/libero_goal_no_noops_1.0.0_lerobot
       view_map:
         image_1: observation.images.image
         image_2: observation.images.wrist_image
+    # 379 episodes / 101,469 frames / 10 tasks
     libero_10_no_noops_1.0.0_lerobot:
       path: /root/Evo-Depth/data/libero/libero_10_no_noops_1.0.0_lerobot
       view_map:

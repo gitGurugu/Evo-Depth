@@ -3,6 +3,7 @@
 #
 #   bash scripts/run_libero.sh
 #   bash scripts/run_libero.sh libero_goal
+#   CKPT=checkpoints/unit_evo/step_best bash scripts/run_libero.sh libero_spatial
 #
 # InternVL3-1B and DA3-BASE come from setup_libero_ckpt.sh.
 
@@ -11,8 +12,11 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SUITE="${1:-libero_spatial}"
 PORT="${EVO_DEPTH_SERVER_PORT:-9000}"
-CKPT="$ROOT/checkpoints/libero/$SUITE"
-LOG_DIR="$ROOT/LIBERO-evaluation/logs/$SUITE"
+CKPT="${CKPT:-$ROOT/checkpoints/libero/$SUITE}"
+LOG_DIR="${LOG_DIR:-$ROOT/LIBERO-evaluation/logs/$SUITE}"
+# Resolve relative paths before cd into Evo_depth (server cwd).
+[[ "$CKPT" = /* ]] || CKPT="$ROOT/$CKPT"
+[[ "$LOG_DIR" = /* ]] || LOG_DIR="$ROOT/$LOG_DIR"
 SERVER_LOG="$LOG_DIR/server.log"
 PID_FILE="$LOG_DIR/server.pid"
 SERVER_PY="$ROOT/.venv/bin/python"
